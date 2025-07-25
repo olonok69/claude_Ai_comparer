@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "Google Search": {
+      "transport": "sse",
+      "url": "http://localhost:8002/sse",
+      "timeout": 1200,
+      "headers": null,
+      "sse_read_timeout": 1800
+    },
+    "Perplexity Search": {
+      "transport": "sse",
+      "url": "http://localhost:8001/sse",
+      "timeout": 600,
+      "headers": null,
+      "sse_read_timeout": 900
+    },
+    "Company Tagging": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["-m", "client.mcp_servers.company_tagging.server"],
+      "env": {
+        "PERPLEXITY_API_KEY": "${PERPLEXITY_API_KEY}",
+        "PERPLEXITY_MODEL": "${PERPLEXITY_MODEL}"
+      },
+      "cwd": "."
+    }
+  }
+}
