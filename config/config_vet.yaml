@@ -241,6 +241,7 @@ default_visitor_properties:
   what_type_does_your_practice_specialise_in: "NA"
   organisation_type: "NA"
   JobTitle: "NA"
+  show: "bva"
 
 # Environment file location
 env_file: "keys/.env"
