@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
 """
-Neo4j Session Processor Comparison Tool
+Fixed Neo4j Session Processor Comparison Tool
 
-This script compares the outputs of old_neo4j_session_processor.py and neo4j_session_processor.py
-to ensure they produce identical results when processing the same input data.
-
-Usage:
-    python comparers/5_compare_processors.py [--old-config CONFIG_PATH] [--new-config CONFIG_PATH]
+This script compares old and new Neo4j session processors and expects identical results
+since both processors should work correctly with the same logic.
 """
 
 import os
 import sys
-import logging
-import argparse
 import json
-import csv
-import pandas as pd
-import numpy as np
+import argparse
+import logging
 from pathlib import Path
-from datetime import datetime
-import shutil
-from neo4j import GraphDatabase
-import tempfile
-from dotenv import load_dotenv
+from typing import Dict, Any, Tuple
 
-# Add current directory to path to import local modules
+# Add current directory to path
 sys.path.insert(0, os.getcwd())
 
 try:
@@ -32,45 +22,24 @@ try:
     from neo4j_session_processor import Neo4jSessionProcessor as NewNeo4jSessionProcessor
     from utils.config_utils import load_config
     from utils.logging_utils import setup_logging
+    from neo4j import GraphDatabase
+    from dotenv import load_dotenv
 except ImportError as e:
     print(f"❌ Import Error: {e}")
-    print("Make sure you have the following files:")
-    print("1. old_neo4j_session_processor.py")
-    print("2. neo4j_session_processor.py")
-    print("3. utils/config_utils.py")
-    print("4. utils/logging_utils.py")
+    print("\nMake sure you have all required dependencies installed")
     sys.exit(1)
 
 
 class Neo4jSessionProcessorComparison:
-    """A class to compare old and new Neo4j Session Processors."""
-
+    """Compare old and new Neo4j Session Processors expecting identical results."""
+    
     def __init__(self):
-        """Initialize the comparison tool."""
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.comparison_dir = Path("comparers") / "comparisons" / "neo4j_session_processor"
-        self.comparison_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger(__name__)
         
-        self.old_output_dir = self.comparison_dir / f"old_output_{self.timestamp}"
-        self.new_output_dir = self.comparison_dir / f"new_output_{self.timestamp}"
-        
-        self.old_output_dir.mkdir(parents=True, exist_ok=True)
-        self.new_output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Setup logging
-        self.logger = setup_logging(
-            log_file=str(self.comparison_dir / f"comparison_{self.timestamp}.log")
-        )
-
-    def clear_neo4j_test_data(self):
-        """Clear any existing test data from Neo4j to ensure clean comparison."""
-        self.logger.info("Clearing existing Neo4j test data...")
-        
+    def clear_neo4j_data(self, config: Dict[str, Any]) -> bool:
+        """Clear Neo4j session and stream data."""
         try:
-            # Load config to get Neo4j credentials
-            config = load_config("config/config_vet.yaml")
             load_dotenv(config["env_file"])
-            
             uri = os.getenv("NEO4J_URI")
             username = os.getenv("NEO4J_USERNAME")
             password = os.getenv("NEO4J_PASSWORD")
@@ -78,160 +47,31 @@ class Neo4jSessionProcessorComparison:
             driver = GraphDatabase.driver(uri, auth=(username, password))
             
             with driver.session() as session:
-                # Delete all session nodes and stream nodes
-                delete_queries = [
-                    "MATCH (n:Sessions_this_year) DETACH DELETE n",
-                    "MATCH (n:Sessions_past_year) DETACH DELETE n", 
-                    "MATCH (n:Stream) DETACH DELETE n"
-                ]
-                
-                for query in delete_queries:
-                    result = session.run(query)
-                    self.logger.info(f"Executed: {query}")
+                delete_query = "MATCH (n) WHERE n:Sessions_this_year OR n:Sessions_past_year OR n:Stream DETACH DELETE n"
+                session.run(delete_query)
                 
                 # Verify cleanup
                 result = session.run("MATCH (n) WHERE n:Sessions_this_year OR n:Sessions_past_year OR n:Stream RETURN count(n) as count")
-                remaining_count = result.single()["count"]
+                remaining = result.single()["count"]
                 
-                if remaining_count == 0:
-                    self.logger.info("✅ Successfully cleared all test data from Neo4j")
+                if remaining == 0:
+                    self.logger.info("Successfully cleared Neo4j session data")
+                    return True
                 else:
-                    self.logger.warning(f"⚠️ {remaining_count} test nodes still remain in Neo4j")
+                    self.logger.warning(f"{remaining} session nodes still remain")
+                    return False
                     
         except Exception as e:
-            self.logger.error(f"Error clearing Neo4j test data: {e}")
-            raise
+            self.logger.error(f"Error clearing Neo4j data: {e}")
+            return False
         finally:
             if 'driver' in locals():
                 driver.close()
-
-    def run_old_processor(self, config):
-        """Run the old Neo4j session processor."""
-        try:
-            self.logger.info("Running OLD Neo4j Session Processor...")
-            
-            # Create processor and run it
-            old_processor = OldNeo4jSessionProcessor(config)
-            old_statistics = old_processor.process(create_only_new=False)
-            
-            self.logger.info("✅ Old processor completed successfully")
-            return old_processor, old_statistics
-            
-        except Exception as e:
-            self.logger.error(f"Error running old processor: {e}")
-            raise
-
-    def run_new_processor(self, config):
-        """Run the new Neo4j session processor."""
-        try:
-            self.logger.info("Running NEW Neo4j Session Processor...")
-            
-            # Create processor and run it
-            new_processor = NewNeo4jSessionProcessor(config)
-            new_statistics = new_processor.process(create_only_new=False)
-            
-            self.logger.info("✅ New processor completed successfully")
-            return new_processor, new_statistics
-            
-        except Exception as e:
-            self.logger.error(f"Error running new processor: {e}")
-            raise
-
-    def compare_neo4j_nodes(self, config):
-        """Compare the nodes created in Neo4j by both processors."""
-        self.logger.info("Comparing Neo4j nodes...")
-        self.logger.info("Note: Old processor doesn't add 'show' attribute, new processor does")
-        
-        try:
-            load_dotenv(config["env_file"])
-            uri = os.getenv("NEO4J_URI")
-            username = os.getenv("NEO4J_USERNAME")
-            password = os.getenv("NEO4J_PASSWORD")
-            
-            driver = GraphDatabase.driver(uri, auth=(username, password))
-            
-            comparisons = {}
-            
-            with driver.session() as session:
-                # Define node types to compare
-                node_types = [
-                    ("Sessions_this_year", "session_id"),
-                    ("Sessions_past_year", "session_id"),
-                    ("Stream", "name")
-                ]
-                
-                for node_label, id_property in node_types:
-                    # Get all nodes of this type
-                    query = f"""
-                    MATCH (n:{node_label})
-                    RETURN n.{id_property} as id, properties(n) as props
-                    ORDER BY n.{id_property}
-                    """
-                    
-                    result = session.run(query)
-                    nodes = list(result)
-                    
-                    comparisons[node_label] = {
-                        "count": len(nodes),
-                        "sample_properties": nodes[:3] if nodes else [],
-                        "all_nodes": nodes
-                    }
-                    
-                    self.logger.info(f"Found {len(nodes)} nodes of type {node_label}")
-                
-                # Compare relationships
-                rel_query = """
-                MATCH (s)-[r:HAS_STREAM]->(stream:Stream)
-                RETURN type(r) as rel_type, s.session_id as session_id, stream.name as stream_name
-                ORDER BY s.session_id, stream.name
-                """
-                
-                result = session.run(rel_query)
-                relationships = list(result)
-                
-                comparisons["relationships"] = {
-                    "HAS_STREAM_count": len(relationships),
-                    "sample_relationships": relationships[:5] if relationships else [],
-                    "all_relationships": relationships
-                }
-                
-                self.logger.info(f"Found {len(relationships)} HAS_STREAM relationships")
-                
-                # Analyze show attribute distribution (key difference between processors)
-                show_query = """
-                MATCH (n) 
-                WHERE n:Sessions_this_year OR n:Sessions_past_year OR n:Stream
-                RETURN 
-                    labels(n) as node_type,
-                    CASE WHEN n.show IS NOT NULL THEN n.show ELSE 'NULL' END as show_value,
-                    count(n) as count
-                ORDER BY node_type, show_value
-                """
-                
-                result = session.run(show_query)
-                show_distribution = list(result)
-                
-                comparisons["show_attributes"] = {
-                    "distribution": show_distribution,
-                    "nodes_with_show": sum(r["count"] for r in show_distribution if r["show_value"] != "NULL"),
-                    "nodes_without_show": sum(r["count"] for r in show_distribution if r["show_value"] == "NULL")
-                }
-                
-                self.logger.info(f"Show attribute analysis: {len([r for r in show_distribution if r['show_value'] != 'NULL'])} types with show, {len([r for r in show_distribution if r['show_value'] == 'NULL'])} types without")
-                
-        except Exception as e:
-            self.logger.error(f"Error comparing Neo4j nodes: {e}")
-            raise
-        finally:
-            if 'driver' in locals():
-                driver.close()
-        
-        return comparisons
-
-    def compare_statistics(self, old_stats, new_stats):
-        """Compare statistics from both processors."""
+    
+    def compare_processor_statistics(self, old_stats: Dict, new_stats: Dict) -> Dict[str, Any]:
+        """Compare statistics from both processors expecting identical results."""
         self.logger.info("Comparing processor statistics...")
-        self.logger.info("Note: The old processor has bugs in stream/relationship creation that the new processor fixes")
+        self.logger.info("Both processors should produce identical results")
         
         comparison = {
             "nodes_created": {},
@@ -239,7 +79,7 @@ class Neo4jSessionProcessorComparison:
             "relationships_created": {},
             "relationships_skipped": {},
             "totals": {},
-            "bug_fixes": {}
+            "all_identical": True
         }
         
         # Compare session node creation (should match exactly)
@@ -256,26 +96,26 @@ class Neo4jSessionProcessorComparison:
                 "difference": new_val - old_val,
                 "expected": "Should match exactly"
             }
+            
+            if old_val != new_val:
+                comparison["all_identical"] = False
         
-        # Compare stream creation (old=0 due to bug, new>0 is fix)
+        # Compare stream creation (should match exactly)
         old_streams = old_stats.get("nodes_created", {}).get("streams", 0)
         new_streams = new_stats.get("nodes_created", {}).get("streams", 0)
         
         comparison["nodes_created"]["streams"] = {
             "old": old_streams,
             "new": new_streams,
-            "match": False,  # Expected to be different
+            "match": old_streams == new_streams,
             "difference": new_streams - old_streams,
-            "expected": "Old=0 (bug), New>0 (fixed)"
+            "expected": "Should match exactly"
         }
         
-        comparison["bug_fixes"]["stream_creation"] = {
-            "old_broken": old_streams == 0,
-            "new_fixed": new_streams > 0,
-            "bug_fixed": old_streams == 0 and new_streams > 0
-        }
+        if old_streams != new_streams:
+            comparison["all_identical"] = False
         
-        # Compare relationship creation (old=0 due to missing streams, new>0 is fix)
+        # Compare relationship creation (should match exactly)
         rel_keys = ["sessions_this_year_has_stream", "sessions_past_year_has_stream"]
         
         for key in rel_keys:
@@ -285,267 +125,224 @@ class Neo4jSessionProcessorComparison:
             comparison["relationships_created"][key] = {
                 "old": old_val,
                 "new": new_val,
-                "match": False,  # Expected to be different
-                "difference": new_val - old_val,
-                "expected": "Old=0 (no streams), New>0 (fixed)"
-            }
-        
-        comparison["bug_fixes"]["relationship_creation"] = {
-            "old_broken": all(old_stats.get("relationships_created", {}).get(k, 0) == 0 for k in rel_keys),
-            "new_fixed": all(new_stats.get("relationships_created", {}).get(k, 0) > 0 for k in rel_keys),
-            "bug_fixed": (all(old_stats.get("relationships_created", {}).get(k, 0) == 0 for k in rel_keys) and 
-                         all(new_stats.get("relationships_created", {}).get(k, 0) > 0 for k in rel_keys))
-        }
-        
-        # Compare totals
-        total_keys = ["total_nodes_created", "total_nodes_skipped", "total_relationships_created", "total_relationships_skipped"]
-        for key in total_keys:
-            old_val = old_stats.get(key, 0)
-            new_val = new_stats.get(key, 0)
-            
-            expected_match = key in ["total_nodes_skipped", "total_relationships_skipped"]
-            
-            comparison["totals"][key] = {
-                "old": old_val,
-                "new": new_val,
                 "match": old_val == new_val,
                 "difference": new_val - old_val,
-                "expected": "Should match" if expected_match else "New should be higher (bug fixes)"
+                "expected": "Should match exactly"
             }
+            
+            if old_val != new_val:
+                comparison["all_identical"] = False
+        
+        # Calculate totals
+        old_total_nodes = sum(old_stats.get("nodes_created", {}).values())
+        new_total_nodes = sum(new_stats.get("nodes_created", {}).values())
+        old_total_rels = sum(old_stats.get("relationships_created", {}).values())
+        new_total_rels = sum(new_stats.get("relationships_created", {}).values())
+        
+        comparison["totals"] = {
+            "nodes": {
+                "old": old_total_nodes,
+                "new": new_total_nodes,
+                "match": old_total_nodes == new_total_nodes
+            },
+            "relationships": {
+                "old": old_total_rels,
+                "new": new_total_rels,
+                "match": old_total_rels == new_total_rels
+            }
+        }
+        
+        if old_total_nodes != new_total_nodes or old_total_rels != new_total_rels:
+            comparison["all_identical"] = False
         
         return comparison
-
-    def generate_report(self, old_stats, new_stats, node_comparison, stats_comparison):
+    
+    def compare_neo4j_state(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Compare the current Neo4j database state."""
+        try:
+            load_dotenv(config["env_file"])
+            uri = os.getenv("NEO4J_URI")
+            username = os.getenv("NEO4J_USERNAME")
+            password = os.getenv("NEO4J_PASSWORD")
+            
+            driver = GraphDatabase.driver(uri, auth=(username, password))
+            
+            with driver.session() as session:
+                # Count nodes
+                node_counts = {}
+                node_counts["Sessions_this_year"] = session.run("MATCH (n:Sessions_this_year) RETURN count(n) as count").single()["count"]
+                node_counts["Sessions_past_year"] = session.run("MATCH (n:Sessions_past_year) RETURN count(n) as count").single()["count"]
+                node_counts["Stream"] = session.run("MATCH (n:Stream) RETURN count(n) as count").single()["count"]
+                
+                # Count relationships
+                relationship_counts = {}
+                relationship_counts["HAS_STREAM"] = session.run("MATCH ()-[r:HAS_STREAM]->() RETURN count(r) as count").single()["count"]
+                
+                # Check show attributes
+                show_result = session.run("""
+                    MATCH (n) 
+                    WHERE n:Sessions_this_year OR n:Sessions_past_year OR n:Stream
+                    RETURN 
+                        CASE WHEN n.show IS NOT NULL THEN 'HAS_SHOW' ELSE 'NO_SHOW' END as show_status,
+                        count(n) as count
+                """)
+                
+                show_attributes = {record["show_status"]: record["count"] for record in show_result}
+                
+                return {
+                    "node_counts": node_counts,
+                    "relationship_counts": relationship_counts,
+                    "show_attributes": show_attributes,
+                    "total_nodes": sum(node_counts.values()),
+                    "total_relationships": sum(relationship_counts.values())
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Error comparing Neo4j state: {e}")
+            return None
+        finally:
+            if 'driver' in locals():
+                driver.close()
+    
+    def generate_comparison_report(self, stats_comparison: Dict, old_db_state: Dict, new_db_state: Dict) -> str:
         """Generate a detailed comparison report."""
-        report = f"""# Neo4j Session Processor Comparison Report
-
-## Execution Details
-- **Timestamp**: {self.timestamp}
-- **Old Processor**: old_neo4j_session_processor.py (has bugs)
-- **New Processor**: neo4j_session_processor.py (fixes bugs)
-
-## Important Note
-The old Neo4j session processor has critical bugs that prevent it from creating Stream nodes and HAS_STREAM relationships. The new processor fixes these bugs. The differences shown below are **expected** and indicate successful bug fixes.
-
-## Statistics Comparison
-
-### Session Nodes (Should Match Exactly)
-"""
+        report = "# Neo4j Session Processor Comparison Report\n\n"
         
-        session_keys = ["sessions_this_year", "sessions_past_year_bva", "sessions_past_year_lva"]
-        for key in session_keys:
-            if key in stats_comparison["nodes_created"]:
-                data = stats_comparison["nodes_created"][key]
-                status = "✅ MATCH" if data["match"] else "❌ MISMATCH"
-                report += f"- **{key}**: Old={data['old']}, New={data['new']} ({status})\n"
+        # Executive Summary
+        report += "## Executive Summary\n"
         
-        report += f"""
-### Stream Nodes (Bug Fix - Old=0, New>0 Expected)
-"""
-        if "streams" in stats_comparison["nodes_created"]:
-            data = stats_comparison["nodes_created"]["streams"]
-            if data["old"] == 0 and data["new"] > 0:
-                status = "✅ BUG FIXED"
-            else:
-                status = "❌ UNEXPECTED"
-            report += f"- **streams**: Old={data['old']}, New={data['new']} ({status})\n"
-        
-        report += f"""
-### Stream Relationships (Bug Fix - Old=0, New>0 Expected)
-"""
-        rel_keys = ["sessions_this_year_has_stream", "sessions_past_year_has_stream"]
-        for key in rel_keys:
-            if key in stats_comparison["relationships_created"]:
-                data = stats_comparison["relationships_created"][key]
-                if data["old"] == 0 and data["new"] > 0:
-                    status = "✅ BUG FIXED"
-                else:
-                    status = "❌ UNEXPECTED"
-                report += f"- **{key}**: Old={data['old']}, New={data['new']} ({status})\n"
-        
-        report += "\n## Bug Fix Analysis\n"
-        
-        if "bug_fixes" in stats_comparison:
-            bug_fixes = stats_comparison["bug_fixes"]
-            
-            if "stream_creation" in bug_fixes:
-                stream_fix = bug_fixes["stream_creation"]
-                report += f"- **Stream Creation Bug**: {'✅ FIXED' if stream_fix['bug_fixed'] else '❌ NOT FIXED'}\n"
-                report += f"  - Old processor created 0 streams (broken): {stream_fix['old_broken']}\n"
-                report += f"  - New processor creates streams properly: {stream_fix['new_fixed']}\n"
-            
-            if "relationship_creation" in bug_fixes:
-                rel_fix = bug_fixes["relationship_creation"]
-                report += f"- **Relationship Creation Bug**: {'✅ FIXED' if rel_fix['bug_fixed'] else '❌ NOT FIXED'}\n"
-                report += f"  - Old processor created 0 relationships (no streams): {rel_fix['old_broken']}\n"
-                report += f"  - New processor creates relationships properly: {rel_fix['new_fixed']}\n"
-        
-        report += "\n## Show Attribute Analysis\n"
-        
-        if "show_attributes" in node_comparison:
-            show_data = node_comparison["show_attributes"]
-            report += f"- **Nodes with 'show' attribute**: {show_data['nodes_with_show']} (New processor feature)\n"
-            report += f"- **Nodes without 'show' attribute**: {show_data['nodes_without_show']} (Old processor limitation)\n"
-            
-            if show_data["distribution"]:
-                report += "\n### Show Attribute Distribution:\n"
-                for item in show_data["distribution"]:
-                    node_type = item["node_type"][0] if item["node_type"] else "Unknown"
-                    show_val = item["show_value"]
-                    count = item["count"]
-                    
-                    if show_val == "NULL":
-                        report += f"- **{node_type}**: {count} nodes without show attribute (old processor)\n"
-                    else:
-                        report += f"- **{node_type}**: {count} nodes with show='{show_val}' (new processor)\n"
-        
-        report += "\n## Neo4j Database State\n"
-        
-        for node_type, data in node_comparison.items():
-            if node_type not in ["relationships", "show_attributes"]:
-                report += f"- **{node_type}**: {data['count']} nodes\n"
-        
-        if "relationships" in node_comparison:
-            rel_data = node_comparison["relationships"]
-            report += f"- **HAS_STREAM relationships**: {rel_data['HAS_STREAM_count']} relationships\n"
-        
-        # Overall assessment
-        bugs_fixed = True
-        if "bug_fixes" in stats_comparison:
-            bugs_fixed = all(
-                fix_data.get("bug_fixed", False) 
-                for fix_data in stats_comparison["bug_fixes"].values()
-            )
-        
-        sessions_match = all(
-            stats_comparison["nodes_created"][key]["match"] 
-            for key in session_keys 
-            if key in stats_comparison["nodes_created"]
-        )
-        
-        # Check if show attributes are properly distributed (should have both NULL and non-NULL)
-        show_proper = False
-        if "show_attributes" in node_comparison:
-            show_data = node_comparison["show_attributes"]
-            show_proper = show_data["nodes_with_show"] > 0 and show_data["nodes_without_show"] > 0
-        
-        report += f"\n## Overall Assessment\n"
-        if sessions_match and bugs_fixed and show_proper:
-            report += "🎉 **SUCCESS**: New processor fixes all old processor bugs and adds new features!\n"
-            report += "✅ Session nodes are created identically by both processors.\n"
-            report += "✅ Stream nodes and relationships are now created properly (old processor couldn't do this).\n"
-            report += "✅ New processor adds 'show' attributes while old processor doesn't (expected improvement).\n"
-            report += "✅ The new processor is a complete improvement over the old one.\n"
+        if stats_comparison.get("all_identical", False):
+            report += "✅ **SUCCESS**: Both processors produce identical results!\n"
+            report += "✅ The new processor is a perfect replacement for the old processor.\n\n"
         else:
-            report += "❌ **UNEXPECTED RESULTS**: The comparison doesn't show expected patterns!\n"
-            if not sessions_match:
-                report += "⚠️ Session node creation differs unexpectedly.\n"
-            if not bugs_fixed:
-                report += "⚠️ Expected bug fixes are not working as intended.\n"
-            if not show_proper:
-                report += "⚠️ Show attribute distribution is not as expected.\n"
+            report += "❌ **FAILURE**: Processors produce different results!\n"
+            report += "⚠️ The new processor needs further fixes to match the old processor.\n\n"
+        
+        # Statistics Comparison
+        report += "## Statistics Comparison\n\n"
+        
+        # Session nodes
+        report += "### Session Node Creation\n"
+        for key, data in stats_comparison["nodes_created"].items():
+            if key.startswith("sessions_"):
+                status = "✅ MATCH" if data["match"] else "❌ MISMATCH"
+                report += f"- **{key}**: Old={data['old']}, New={data['new']} - {status}\n"
+        
+        # Stream nodes
+        stream_data = stats_comparison["nodes_created"]["streams"]
+        status = "✅ MATCH" if stream_data["match"] else "❌ MISMATCH"
+        report += f"- **streams**: Old={stream_data['old']}, New={stream_data['new']} - {status}\n\n"
+        
+        # Relationships
+        report += "### Relationship Creation\n"
+        for key, data in stats_comparison["relationships_created"].items():
+            status = "✅ MATCH" if data["match"] else "❌ MISMATCH"
+            report += f"- **{key}**: Old={data['old']}, New={data['new']} - {status}\n"
+        
+        # Database State Comparison
+        report += "\n## Database State Comparison\n\n"
+        
+        if old_db_state and new_db_state:
+            report += "### Node Counts\n"
+            for node_type in old_db_state["node_counts"]:
+                old_count = old_db_state["node_counts"][node_type]
+                new_count = new_db_state["node_counts"][node_type]
+                status = "✅ MATCH" if old_count == new_count else "❌ MISMATCH"
+                report += f"- **{node_type}**: Old={old_count}, New={new_count} - {status}\n"
+            
+            report += "\n### Relationship Counts\n"
+            for rel_type in old_db_state["relationship_counts"]:
+                old_count = old_db_state["relationship_counts"][rel_type]
+                new_count = new_db_state["relationship_counts"][rel_type]
+                status = "✅ MATCH" if old_count == new_count else "❌ MISMATCH"
+                report += f"- **{rel_type}**: Old={old_count}, New={new_count} - {status}\n"
+        
+        # Totals
+        report += "\n## Totals\n"
+        totals = stats_comparison["totals"]
+        
+        nodes_status = "✅ MATCH" if totals["nodes"]["match"] else "❌ MISMATCH"
+        report += f"- **Total Nodes**: Old={totals['nodes']['old']}, New={totals['nodes']['new']} - {nodes_status}\n"
+        
+        rels_status = "✅ MATCH" if totals["relationships"]["match"] else "❌ MISMATCH"
+        report += f"- **Total Relationships**: Old={totals['relationships']['old']}, New={totals['relationships']['new']} - {rels_status}\n"
         
         return report
-
-    def run_comparison(self, old_config_path="config/config.yaml", new_config_path="config/config_vet.yaml"):
-        """Run the complete comparison process."""
+    
+    def run_comparison(self, old_config_path: str, new_config_path: str) -> bool:
+        """Run the complete comparison between processors."""
         try:
-            self.logger.info(f"Starting Neo4j Session Processor Comparison")
-            self.logger.info(f"Old config: {old_config_path}")
-            self.logger.info(f"New config: {new_config_path}")
-            
             # Load configurations
+            self.logger.info("Loading configurations...")
             old_config = load_config(old_config_path)
             new_config = load_config(new_config_path)
             
-            # Clear existing test data
-            self.clear_neo4j_test_data()
+            # Clear Neo4j data
+            self.logger.info("Clearing Neo4j data...")
+            if not self.clear_neo4j_data(new_config):
+                self.logger.error("Failed to clear Neo4j data")
+                return False
             
             # Run old processor
-            old_processor, old_stats = self.run_old_processor(old_config)
+            self.logger.info("Running old processor...")
+            old_processor = OldNeo4jSessionProcessor(old_config)
+            old_stats = old_processor.process(create_only_new=False)
             
-            # Clear test data again before running new processor
-            self.clear_neo4j_test_data()
+            # Capture old processor state
+            old_db_state = self.compare_neo4j_state(old_config)
             
-            # Run new processor
-            new_processor, new_stats = self.run_new_processor(new_config)
+            # Clear and run new processor
+            self.logger.info("Clearing data and running new processor...")
+            self.clear_neo4j_data(new_config)
             
-            # Compare Neo4j database state
-            node_comparison = self.compare_neo4j_nodes(new_config)
+            new_processor = NewNeo4jSessionProcessor(new_config)
+            new_stats = new_processor.process(create_only_new=False)
             
-            # Compare statistics
-            stats_comparison = self.compare_statistics(old_stats, new_stats)
+            # Capture new processor state
+            new_db_state = self.compare_neo4j_state(new_config)
+            
+            # Compare results
+            self.logger.info("Comparing results...")
+            stats_comparison = self.compare_processor_statistics(old_processor.statistics, new_processor.statistics)
             
             # Generate report
-            report = self.generate_report(old_stats, new_stats, node_comparison, stats_comparison)
+            report = self.generate_comparison_report(stats_comparison, old_db_state, new_db_state)
             
-            # Save report
-            report_path = self.comparison_dir / f"neo4j_session_comparison_report_{self.timestamp}.md"
-            with open(report_path, 'w', encoding='utf-8') as f:
+            # Save results
+            report_path = "logs/neo4j_session_processor_comparison_report.md"
+            with open(report_path, 'w') as f:
                 f.write(report)
             
-            # Save detailed comparison data
+            comparison_data_path = "logs/neo4j_session_processor_comparison_data.json"
             comparison_data = {
-                "timestamp": self.timestamp,
-                "old_statistics": old_stats,
-                "new_statistics": new_stats,
-                "statistics_comparison": stats_comparison,
-                "node_comparison": node_comparison
+                "stats_comparison": stats_comparison,
+                "old_db_state": old_db_state,
+                "new_db_state": new_db_state
             }
+            with open(comparison_data_path, 'w') as f:
+                json.dump(comparison_data, f, indent=2)
             
-            comparison_data_path = self.comparison_dir / f"neo4j_session_comparison_data_{self.timestamp}.json"
-            with open(comparison_data_path, 'w', encoding='utf-8') as f:
-                json.dump(comparison_data, f, indent=2, default=str, ensure_ascii=False)
+            # Print results
+            print("\n" + "=" * 80)
+            print("🔍 COMPARISON RESULTS")
+            print("=" * 80)
             
-            # Print summary
-            print(f"\n{'='*60}")
-            print(f"COMPARISON SUMMARY")
-            print(f"{'='*60}")
+            success = stats_comparison.get("all_identical", False)
             
-            # Check if all expected patterns are working
-            session_nodes_match = all(
-                stats_comparison["nodes_created"][key]["match"] 
-                for key in ["sessions_this_year", "sessions_past_year_bva", "sessions_past_year_lva"]
-                if key in stats_comparison["nodes_created"]
-            )
-            
-            bugs_fixed = True
-            if "bug_fixes" in stats_comparison:
-                bugs_fixed = all(
-                    fix_data.get("bug_fixed", False) 
-                    for fix_data in stats_comparison["bug_fixes"].values()
-                )
-            
-            # Check show attribute distribution (should have both old nodes without show and new nodes with show)
-            show_distribution_correct = False
-            if "show_attributes" in node_comparison:
-                show_data = node_comparison["show_attributes"]
-                show_distribution_correct = show_data["nodes_with_show"] > 0 and show_data["nodes_without_show"] > 0
-            
-            if session_nodes_match and bugs_fixed and show_distribution_correct:
-                print("🎉 SUCCESS: New processor fixes all old processor bugs and adds new features!")
-                print("✅ Session nodes are created identically by both processors.")
-                print("✅ Stream nodes and relationships are now created properly.")
-                print("✅ New processor adds 'show' attributes while old processor doesn't (expected).")
-                print("✅ The new processor is a complete improvement over the old one.")
-                success = True
+            if success:
+                print("🎉 SUCCESS: Both processors produce IDENTICAL results!")
+                print("✅ Session nodes match exactly")
+                print("✅ Stream nodes match exactly") 
+                print("✅ Relationships match exactly")
+                print("✅ The new processor is a perfect replacement!")
             else:
-                print("❌ FAILURE: Expected improvements are not working correctly!")
-                print("⚠️ The processors don't show the expected improvement pattern.")
+                print("❌ FAILURE: Processors produce DIFFERENT results!")
                 
-                # Show specific issues
-                if not session_nodes_match:
-                    print("   - Session node creation differs unexpectedly")
-                if not bugs_fixed:
-                    print("   - Stream/relationship bugs are not fixed as expected")
-                if not show_distribution_correct:
-                    print("   - Show attribute distribution is not as expected")
-                    if "show_attributes" in node_comparison:
-                        show_data = node_comparison["show_attributes"]
-                        print(f"     - Nodes with show: {show_data['nodes_with_show']}")
-                        print(f"     - Nodes without show: {show_data['nodes_without_show']}")
-                
-                success = False
+                # Show specific mismatches
+                if not all(data["match"] for data in stats_comparison["nodes_created"].values()):
+                    print("   - Node creation differs")
+                if not all(data["match"] for data in stats_comparison["relationships_created"].values()):
+                    print("   - Relationship creation differs")
             
             print(f"\nDetailed reports saved to:")
             print(f"  - {report_path}")
@@ -574,6 +371,9 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(log_file="logs/neo4j_session_processor_comparison.log")
     
     # Create comparison instance and run
     comparison = Neo4jSessionProcessorComparison()

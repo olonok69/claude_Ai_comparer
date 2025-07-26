@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Simple Test Runner for Neo4j Session Processors
+Fixed Simple Test Runner for Neo4j Session Processors
 
-This script runs both neo4j session processors and does a quick comparison of key outputs.
+This script runs both neo4j session processors and expects IDENTICAL results
+since both processors should work correctly with the same logic.
 """
 
 import os
@@ -51,15 +52,8 @@ def clear_neo4j_session_data():
         
         with driver.session() as session:
             # Delete all session and stream nodes
-            delete_queries = [
-                "MATCH (n:Sessions_this_year) DETACH DELETE n",
-                "MATCH (n:Sessions_past_year) DETACH DELETE n",
-                "MATCH (n:Stream) DETACH DELETE n"
-            ]
-            
-            for query in delete_queries:
-                result = session.run(query)
-                print(f"  Executed: {query}")
+            delete_query = "MATCH (n) WHERE n:Sessions_this_year OR n:Sessions_past_year OR n:Stream DETACH DELETE n"
+            session.run(delete_query)
             
             # Verify cleanup
             result = session.run("MATCH (n) WHERE n:Sessions_this_year OR n:Sessions_past_year OR n:Stream RETURN count(n) as count")
@@ -79,10 +73,9 @@ def clear_neo4j_session_data():
 
 
 def compare_statistics(old_processor, new_processor):
-    """Compare the statistics from both processors."""
+    """Compare the statistics from both processors - expecting identical results."""
     print("\n📊 Comparing Statistics...")
-    print("⚠️  Note: The old processor has a bug where it fails to create Stream nodes and relationships.")
-    print("    This is expected and indicates the new processor fixes these issues.")
+    print("✅ Both processors should now produce identical results.")
     
     comparisons = []
     
@@ -94,9 +87,9 @@ def compare_statistics(old_processor, new_processor):
     old_stats = old_processor.statistics
     new_stats = new_processor.statistics
     
-    # Compare session node creation (should match)
+    # Compare session node creation (should match exactly)
     session_keys = ["sessions_this_year", "sessions_past_year_bva", "sessions_past_year_lva"]
-    print(f"\n🔍 Comparing session node creation (should match):")
+    print(f"\n🔍 Comparing session node creation (should match exactly):")
     
     for key in session_keys:
         old_count = old_stats["nodes_created"].get(key, 0)
@@ -111,22 +104,22 @@ def compare_statistics(old_processor, new_processor):
             print(f"    ❌ Mismatch")
             comparisons.append(False)
     
-    # Check stream node creation (old should be 0, new should be > 0)
-    print(f"\n🔍 Comparing stream node creation (old=0 due to bug, new>0 is correct):")
+    # Compare stream node creation (should match exactly)
+    print(f"\n🔍 Comparing stream node creation (should match exactly):")
     old_streams = old_stats["nodes_created"].get("streams", 0)
     new_streams = new_stats["nodes_created"].get("streams", 0)
     
     print(f"  - streams: Old={old_streams}, New={new_streams}")
     
-    if old_streams == 0 and new_streams > 0:
-        print(f"    ✅ Expected: Old processor bug fixed by new processor")
+    if old_streams == new_streams:
+        print(f"    ✅ Match")
         comparisons.append(True)
     else:
-        print(f"    ❌ Unexpected stream node counts")
+        print(f"    ❌ Mismatch")
         comparisons.append(False)
     
-    # Check relationship creation (old should be 0, new should be > 0)
-    print(f"\n🔍 Comparing relationship creation (old=0 due to missing streams, new>0 is correct):")
+    # Compare relationship creation (should match exactly)
+    print(f"\n🔍 Comparing relationship creation (should match exactly):")
     rel_keys = ["sessions_this_year_has_stream", "sessions_past_year_has_stream"]
     
     for key in rel_keys:
@@ -135,31 +128,27 @@ def compare_statistics(old_processor, new_processor):
         
         print(f"  - {key}: Old={old_count}, New={new_count}")
         
-        if old_count == 0 and new_count > 0:
-            print(f"    ✅ Expected: Old processor bug fixed by new processor")
+        if old_count == new_count:
+            print(f"    ✅ Match")
             comparisons.append(True)
         else:
-            print(f"    ❌ Unexpected relationship counts")
+            print(f"    ❌ Mismatch")
             comparisons.append(False)
     
     # Overall assessment
-    session_nodes_match = all(comparisons[:len(session_keys)])
-    stream_fix_correct = comparisons[len(session_keys)]
-    relationships_fix_correct = all(comparisons[len(session_keys)+1:])
+    all_match = all(comparisons)
     
     print(f"\n📋 Summary:")
-    print(f"  - Session nodes match: {'✅' if session_nodes_match else '❌'}")
-    print(f"  - Stream nodes fixed: {'✅' if stream_fix_correct else '❌'}")
-    print(f"  - Relationships fixed: {'✅' if relationships_fix_correct else '❌'}")
+    print(f"  - Session nodes match: {'✅' if comparisons[0:3] == [True, True, True] else '❌'}")
+    print(f"  - Stream nodes match: {'✅' if comparisons[3] else '❌'}")
+    print(f"  - Relationships match: {'✅' if comparisons[4:6] == [True, True] else '❌'}")
     
-    return session_nodes_match and stream_fix_correct and relationships_fix_correct
+    return all_match
 
 
 def compare_neo4j_nodes(config):
-    """Compare the actual nodes created in Neo4j."""
+    """Compare the actual nodes created in Neo4j and return structured data."""
     print("\n🔍 Comparing Neo4j Database State...")
-    print("⚠️  Note: Old processor doesn't add 'show' attribute, new processor does.")
-    print("    This difference is expected and beneficial.")
     
     try:
         load_dotenv(config["env_file"])
@@ -197,7 +186,7 @@ def compare_neo4j_nodes(config):
             for rel_type, count in relationship_counts.items():
                 print(f"  - {rel_type}: {count}")
             
-            # Check show attribute distribution (only new processor adds this)
+            # Check show attribute distribution
             result = session.run("""
                 MATCH (n) 
                 WHERE n:Sessions_this_year OR n:Sessions_past_year OR n:Stream
@@ -217,9 +206,9 @@ def compare_neo4j_nodes(config):
                     count = record['count']
                     
                     if show_val == 'NULL':
-                        print(f"  - {node_type}: show=NULL ({count} nodes) - Old processor")
+                        print(f"  - {node_type}: show=NULL ({count} nodes)")
                     else:
-                        print(f"  - {node_type}: show='{show_val}' ({count} nodes) - New processor")
+                        print(f"  - {node_type}: show='{show_val}' ({count} nodes)")
             
             # Validation: Check if we have the expected structure
             sessions_total = node_counts["Sessions_this_year"] + node_counts["Sessions_past_year"]
@@ -231,26 +220,25 @@ def compare_neo4j_nodes(config):
             print(f"  - Stream nodes: {streams_count} {'✅' if streams_count > 0 else '❌ Missing'}")
             print(f"  - HAS_STREAM relationships: {relationships_count} {'✅' if relationships_count > 0 else '❌ Missing'}")
             
-            # Check for show attribute presence (new processor feature)
-            show_nodes = sum(1 for r in show_distribution if r['show_value'] != 'NULL')
-            null_show_nodes = sum(1 for r in show_distribution if r['show_value'] == 'NULL')
-            
-            if show_nodes > 0:
-                print(f"  - Nodes with 'show' attribute: {show_nodes} ✅ (New processor feature)")
-            if null_show_nodes > 0:
-                print(f"  - Nodes without 'show' attribute: {null_show_nodes} ⚠️ (Old processor limitation)")
-            
-            # The new processor should create a proper graph structure
+            # The processor should create a proper graph structure
             if streams_count > 0 and relationships_count > 0:
                 print("  ✅ Complete session-stream graph structure created")
-                return True
+                validation_passed = True
             else:
                 print("  ❌ Graph structure incomplete")
-                return False
+                validation_passed = False
+            
+            # Return the structured data
+            return {
+                "node_counts": node_counts,
+                "relationship_counts": relationship_counts,
+                "show_distribution": show_distribution,
+                "validation_passed": validation_passed
+            }
             
     except Exception as e:
         print(f"❌ Error comparing Neo4j nodes: {e}")
-        return False
+        return None
     finally:
         if 'driver' in locals():
             driver.close()
@@ -262,7 +250,7 @@ def run_test():
     print("=" * 60)
     
     # Setup logging
-    logger = setup_logging(log_file="logs/simple_test_5.log")
+    logger = setup_logging(log_file="logs/simple_test_5_fixed.log")
     
     try:
         # Load configurations
@@ -339,10 +327,11 @@ def run_test():
             print("🎉 SUCCESS: All outputs are IDENTICAL!")
             print("✅ The new Neo4j session processor produces the same results as the old one.")
             print("✅ Both processors create the same nodes and relationships in Neo4j.")
+            print("✅ The new processor is a perfect replacement for the old processor.")
             return True
         else:
             print("❌ FAILURE: Outputs are DIFFERENT!")
-            print("⚠️  The new processor produces different results.")
+            print("⚠️ The new processor produces different results.")
             if not statistics_match:
                 print("   - Processor statistics differ")
             if not db_states_match:
