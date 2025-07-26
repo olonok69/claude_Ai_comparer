@@ -4,8 +4,10 @@ import pandas as pd
 import string
 import json
 from typing import Dict, List, Set, Tuple
-import functools
 
+from pandas.errors import SettingWithCopyWarning
+import warnings
+warnings.simplefilter(action="ignore", category=(SettingWithCopyWarning))
 
 class ScanProcessor:
     """Process scan data for event analytics - Generic Version."""

@@ -1,33 +1,37 @@
+#!/usr/bin/env python3
+"""
+Session Data Processor
+
+This module processes conference session data and generates stream descriptions.
+It handles filtering, cleaning, and organizing session data for different events.
+Fixed to ensure consistent cache and streams.json formats compatible with old processors.
+"""
+
 import os
+import sys
 import json
-import string
-import logging
 import pandas as pd
-import functools
-from typing import Dict, List, Set, Any
+import logging
+from pathlib import Path
+from typing import Dict, Set, List
 from dotenv import load_dotenv, dotenv_values
-from langchain_openai import ChatOpenAI, AzureChatOpenAI
-
-
-# Configure logger
-logger = logging.getLogger(__name__)
-
-
-# Optional decorator for logging function call
-def log_function_call(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        logger = logging.getLogger(func.__module__)
-        logger.debug(f"Entering {func.__name__}")
-        result = func(*args, **kwargs)
-        logger.debug(f"Exiting {func.__name__}")
-        return result
-
-    return wrapper
+from pandas.errors import SettingWithCopyWarning
+import warnings
+warnings.simplefilter(action="ignore", category=(SettingWithCopyWarning))
+# Optional imports for LLM functionality
+try:
+    from langchain_openai import ChatOpenAI, AzureChatOpenAI
+    has_langchain = True
+except ImportError:
+    has_langchain = False
+    print("LangChain not available. Stream descriptions will not be generated.")
 
 
 class SessionProcessor:
-    """Process session data for event analytics - Generic Version."""
+    """
+    Process session data and generate stream descriptions for conference events.
+    Fixed to maintain compatibility with old processor formats.
+    """
 
     def __init__(self, config: Dict):
         """
@@ -224,6 +228,10 @@ class SessionProcessor:
                 "title"
             ].apply(self.clean_text)
 
+            # Update aliases key_text
+            self.session_last_filtered_bva["key_text"] = self.session_last_filtered_main["key_text"]
+            self.session_last_filtered_lva["key_text"] = self.session_last_filtered_secondary["key_text"]
+
             # Remove duplicates
             self.session_this_filtered = self.session_this_filtered.drop_duplicates(
                 subset=["key_text"]
@@ -235,7 +243,7 @@ class SessionProcessor:
                 self.session_last_filtered_secondary.drop_duplicates(subset=["key_text"])
             )
             
-            # Update aliases after all operations
+            # Update aliases after deduplication
             self.session_last_filtered_bva = self.session_last_filtered_main
             self.session_last_filtered_lva = self.session_last_filtered_secondary
 
@@ -252,59 +260,48 @@ class SessionProcessor:
     def select_relevant_columns(self) -> None:
         """Select and clean relevant columns from session data."""
         try:
-            # Define the columns we want to keep - EXACT ORDER as old processor
-            cols_to_keep = [
+            # Define relevant columns to keep
+            relevant_columns = [
                 "session_id",
-                "date",
-                "start_time", 
-                "end_time",
-                "theatre__name",
                 "title",
                 "stream",
                 "synopsis_stripped",
-                "sponsored_session",
-                "sponsored_by",
+                "end_time",
                 "key_text",
+                "sponsored_by",
+                "start_time",
+                "sponsored_session",
+                "date",
+                "theatre__name",
             ]
 
-            # Filter columns for each dataset
-            self.session_this_filtered_valid_cols = self.session_this_filtered[
-                cols_to_keep
-            ].copy()
-            self.session_last_filtered_valid_cols_main = self.session_last_filtered_main[
-                cols_to_keep
-            ].copy()
-            self.session_last_filtered_valid_cols_secondary = self.session_last_filtered_secondary[
-                cols_to_keep
-            ].copy()
+            # Function to safely select columns
+            def safe_select_columns(df, columns):
+                return df[[col for col in columns if col in df.columns]]
+
+            # Apply column selection to all datasets
+            self.session_this_filtered_valid_cols = safe_select_columns(
+                self.session_this_filtered, relevant_columns
+            )
+            self.session_last_filtered_valid_cols_main = safe_select_columns(
+                self.session_last_filtered_main, relevant_columns
+            )
+            self.session_last_filtered_valid_cols_secondary = safe_select_columns(
+                self.session_last_filtered_secondary, relevant_columns
+            )
             
             # Create backward compatible aliases
             self.session_last_filtered_valid_cols_bva = self.session_last_filtered_valid_cols_main
             self.session_last_filtered_valid_cols_lva = self.session_last_filtered_valid_cols_secondary
 
-            # Fill NaN values with empty strings
-            self.session_this_filtered_valid_cols = (
-                self.session_this_filtered_valid_cols.fillna("")
-            )
-            self.session_last_filtered_valid_cols_main = (
-                self.session_last_filtered_valid_cols_main.fillna("")
-            )
-            self.session_last_filtered_valid_cols_secondary = (
-                self.session_last_filtered_valid_cols_secondary.fillna("")
-            )
-            
-            # Update aliases
-            self.session_last_filtered_valid_cols_bva = self.session_last_filtered_valid_cols_main
-            self.session_last_filtered_valid_cols_lva = self.session_last_filtered_valid_cols_secondary
-
-            self.logger.info("Selected relevant columns and cleaned data")
+            self.logger.info("Selected relevant columns from session data")
 
         except Exception as e:
             self.logger.error(f"Error selecting relevant columns: {e}", exc_info=True)
             raise
 
     def extract_unique_streams(self) -> None:
-        """Extract unique stream values from all session datasets."""
+        """Extract unique streams from all session data."""
         try:
             # Collect all stream values
             all_streams = set()
@@ -336,32 +333,31 @@ class SessionProcessor:
     def setup_language_model(self) -> None:
         """Set up the language model for generating stream descriptions."""
         try:
-            # Check if we have OpenAI credentials
-            if "OPENAI_API_KEY" in self.env_config:
+            # UPDATED PRIORITY: Check Azure OpenAI credentials FIRST
+            if all(
+                key in self.env_config
+                for key in [
+                    "AZURE_OPENAI_API_KEY",
+                    "AZURE_OPENAI_ENDPOINT",
+                    "AZURE_DEPLOYMENT",
+                    "AZURE_API_VERSION",
+                ]
+            ):
+                self.llm = AzureChatOpenAI(
+
+                    azure_deployment=self.env_config["AZURE_DEPLOYMENT"],
+                    api_version=self.env_config["AZURE_API_VERSION"],
+                    temperature=0.3,
+                )
+                self.logger.info("Initialized Azure OpenAI language model")
+            # Check OpenAI credentials as FALLBACK
+            elif "OPENAI_API_KEY" in self.env_config:
                 self.llm = ChatOpenAI(
                     api_key=self.env_config["OPENAI_API_KEY"],
                     model="gpt-4o-mini",
                     temperature=0.3,
                 )
                 self.logger.info("Initialized OpenAI language model")
-            # Check if we have Azure OpenAI credentials
-            elif all(
-                key in self.env_config
-                for key in [
-                    "AZURE_API_KEY",
-                    "AZURE_ENDPOINT",
-                    "AZURE_DEPLOYMENT",
-                    "AZURE_API_VERSION",
-                ]
-            ):
-                self.llm = AzureChatOpenAI(
-                    azure_endpoint=self.env_config["AZURE_ENDPOINT"],
-                    azure_api_key=self.env_config["AZURE_API_KEY"],
-                    azure_deployment=self.env_config["AZURE_DEPLOYMENT"],
-                    api_version=self.env_config["AZURE_API_VERSION"],
-                    temperature=0.3,
-                )
-                self.logger.info("Initialized Azure OpenAI language model")
             else:
                 raise ValueError("No valid API credentials found for language model")
 
@@ -370,34 +366,62 @@ class SessionProcessor:
             raise
 
     def load_cached_descriptions(self) -> bool:
-        """Load cached stream descriptions from file."""
+        """Load cached stream descriptions from file and convert to internal format."""
         try:
             if os.path.exists(self.cache_file_path):
                 with open(self.cache_file_path, "r") as cache_file:
-                    self.streams_catalog = json.load(cache_file)
-                self.logger.info(
-                    f"Loaded {len(self.streams_catalog)} cached stream descriptions"
-                )
+                    cached_data = json.load(cache_file)
+                
+                # FIXED: Convert old format cache to internal new format
+                self.streams_catalog = {}
+                
+                if isinstance(cached_data, dict):
+                    for stream_name, description in cached_data.items():
+                        if isinstance(description, str):
+                            # Old format: {"stream_name": "description"}
+                            self.streams_catalog[stream_name] = {
+                                "stream": stream_name,
+                                "description": description
+                            }
+                        elif isinstance(description, dict) and 'description' in description:
+                            # Already in new format (shouldn't happen but handle it)
+                            self.streams_catalog[stream_name] = description
+                        else:
+                            self.logger.warning(f"Unexpected cached description format for {stream_name}: {description}")
+                
+                self.logger.info(f"Loaded {len(self.streams_catalog)} cached stream descriptions and converted to internal format")
                 return True
             else:
-                self.logger.info(
-                    "No cached descriptions found. Will generate new descriptions."
-                )
-                self.cached_descriptions = {}
+                self.logger.info("No cached descriptions found. Will generate new descriptions.")
+                self.streams_catalog = {}
                 return False
+                
         except Exception as e:
             self.logger.error(f"Error loading cached descriptions: {e}", exc_info=True)
-            self.cached_descriptions = {}
+            self.streams_catalog = {}
             return False
 
     def save_cached_descriptions(self) -> None:
-        """Save current stream descriptions to cache file."""
+        """Save current stream descriptions to cache file in CONSISTENT OLD FORMAT."""
         try:
+            # FIXED: Save cache in old format for consistency with streams.json
+            cache_data = {}
+            if hasattr(self, 'streams_catalog') and self.streams_catalog:
+                for stream_data in self.streams_catalog.values():
+                    if isinstance(stream_data, dict) and 'stream' in stream_data and 'description' in stream_data:
+                        # Convert from new format to old format for cache
+                        stream_name = stream_data['stream']
+                        description = stream_data['description']
+                        cache_data[stream_name] = description
+                    else:
+                        # Handle case where stream_data might already be in old format
+                        self.logger.warning(f"Unexpected stream data format in cache: {stream_data}")
+            
+            # Save in old format (consistent with streams.json)
             with open(self.cache_file_path, "w") as cache_file:
-                json.dump(self.streams_catalog, cache_file, indent=4)
-                self.logger.info(
-                    f"Saved {len(self.streams_catalog)} stream descriptions to cache"
-                )
+                json.dump(cache_data, cache_file, indent=4)
+                self.logger.info(f"Saved {len(cache_data)} stream descriptions to cache in old format")
+                
         except Exception as e:
             self.logger.error(f"Error saving cached descriptions: {e}", exc_info=True)
 
@@ -432,6 +456,11 @@ class SessionProcessor:
 
         try:
             self.logger.info("Generating new stream descriptions using language model")
+            
+            # Initialize streams_catalog if not exists
+            if not hasattr(self, 'streams_catalog'):
+                self.streams_catalog = {}
+            
             for stream in self.unique_streams:
                 if stream not in self.streams_catalog:
                     prompt = f"""
@@ -442,6 +471,8 @@ class SessionProcessor:
                     """
 
                     response = self.llm.invoke(prompt)
+                    
+                    # Store in internal new format
                     self.streams_catalog[stream] = {
                         "stream": stream,
                         "description": response.content.strip(),
@@ -451,7 +482,7 @@ class SessionProcessor:
 
             self.logger.info(f"Generated descriptions for {len(self.streams_catalog)} streams")
             
-            # Save the newly generated descriptions to cache
+            # Save the newly generated descriptions to cache (in old format)
             self.save_cached_descriptions()
 
         except Exception as e:
@@ -461,14 +492,38 @@ class SessionProcessor:
             raise
 
     def save_streams_catalog(self) -> None:
-        """Save the streams catalog to JSON file."""
+        """Save the streams catalog to JSON file in OLD PROCESSOR COMPATIBLE FORMAT."""
         try:
             streams_output_file = self.output_files.get("streams_catalog", "streams.json")
             output_path = os.path.join(self.output_dir, "output", streams_output_file)
+            
+            # FIXED: Convert to old processor format (dictionary with stream names as keys)
+            # Old format: {"stream_name": "description", ...}
+            # New format was: [{"stream": "name", "description": "desc"}, ...]
+            
+            old_format_streams = {}
+            if hasattr(self, 'streams_catalog') and self.streams_catalog:
+                for stream_data in self.streams_catalog.values():
+                    if isinstance(stream_data, dict) and 'stream' in stream_data and 'description' in stream_data:
+                        # Convert from new format to old format
+                        stream_name = stream_data['stream']
+                        description = stream_data['description']
+                        old_format_streams[stream_name] = description
+                    else:
+                        # Handle case where stream_data might already be in old format
+                        self.logger.warning(f"Unexpected stream data format: {stream_data}")
+            
+            # If streams_catalog is empty, create simple dictionary from unique_streams
+            if not old_format_streams and hasattr(self, 'unique_streams'):
+                for stream in self.unique_streams:
+                    old_format_streams[stream] = f"Conference stream for {stream} related sessions and topics."
+            
+            # Save in OLD PROCESSOR COMPATIBLE FORMAT (dictionary)
             with open(output_path, "w") as f:
-                json.dump(list(self.streams_catalog.values()), f, indent=2)
+                json.dump(old_format_streams, f, indent=2)
 
-            self.logger.info(f"Saved streams catalog to {output_path}")
+            self.logger.info(f"Saved streams catalog to {output_path} in old processor compatible format")
+            self.logger.info(f"Streams saved: {list(old_format_streams.keys())}")
 
         except Exception as e:
             self.logger.error(f"Error saving streams catalog: {e}", exc_info=True)
@@ -484,70 +539,45 @@ class SessionProcessor:
         Returns:
           A list containing the labels from the input set with a length of 5 or less.
         """
-        short_labels = [
-            label for label in input_set if isinstance(label, str) and len(label) <= 5
-        ]
-        return short_labels
+        return [label for label in input_set if len(label) <= 5]
 
     def expand_sponsor_abbreviations(self) -> None:
-        """Expand sponsor abbreviations to full names using event-specific mappings."""
+        """Expand sponsor abbreviations in session data using map_vets configuration."""
         try:
-            # Skip sponsor abbreviation expansion if no mapping is configured
             if not self.map_vets:
-                self.logger.info("No sponsor abbreviation mapping configured - skipping sponsor expansion")
+                self.logger.info("No sponsor abbreviation mapping configured - skipping expansion")
                 return
 
-            # Get all unique sponsor values
-            list_this_year = set(
-                list(self.session_this_filtered_valid_cols.sponsored_by.unique())
-            )
-            list_last_secondary = set(
-                list(self.session_last_filtered_valid_cols_secondary.sponsored_by.unique())
-            )
-            list_last_main = set(
-                list(self.session_last_filtered_valid_cols_main.sponsored_by.unique())
-            )
+            def expand_abbreviations(sponsor_value):
+                if pd.isna(sponsor_value) or not sponsor_value:
+                    return sponsor_value
+                return self.map_vets.get(str(sponsor_value), str(sponsor_value))
 
-            # Combine all sponsor values
-            full_list_sponsors = list_this_year.union(list_last_secondary, list_last_main)
-
-            # Find abbreviations (short labels)
-            list_abbreviations = set(self.find_short_labels(full_list_sponsors))
-
-            # Check for any missing abbreviations in our mapping
-            map_keys = set(list(self.map_vets.keys()))
-            missing_abbrevs = list_abbreviations.difference(map_keys)
-
-            if missing_abbrevs:
-                self.logger.warning(f"Found unmapped abbreviations: {missing_abbrevs}")
-
-            # Replace abbreviations with full names
-            self.session_last_filtered_valid_cols_secondary["sponsored_by"] = (
-                self.session_last_filtered_valid_cols_secondary["sponsored_by"].replace(
-                    self.map_vets
+            # Apply expansion to all datasets
+            self.session_this_filtered_valid_cols["sponsored_by"] = (
+                self.session_this_filtered_valid_cols["sponsored_by"].apply(
+                    expand_abbreviations
                 )
             )
             self.session_last_filtered_valid_cols_main["sponsored_by"] = (
-                self.session_last_filtered_valid_cols_main["sponsored_by"].replace(
-                    self.map_vets
+                self.session_last_filtered_valid_cols_main["sponsored_by"].apply(
+                    expand_abbreviations
                 )
             )
-            self.session_this_filtered_valid_cols["sponsored_by"] = (
-                self.session_this_filtered_valid_cols["sponsored_by"].replace(
-                    self.map_vets
+            self.session_last_filtered_valid_cols_secondary["sponsored_by"] = (
+                self.session_last_filtered_valid_cols_secondary["sponsored_by"].apply(
+                    expand_abbreviations
                 )
             )
             
-            # Update backward compatible aliases
+            # Update aliases
             self.session_last_filtered_valid_cols_bva = self.session_last_filtered_valid_cols_main
             self.session_last_filtered_valid_cols_lva = self.session_last_filtered_valid_cols_secondary
 
-            self.logger.info("Expanded sponsor abbreviations to full names")
+            self.logger.info(f"Expanded sponsor abbreviations using {len(self.map_vets)} mappings")
 
         except Exception as e:
-            self.logger.error(
-                f"Error expanding sponsor abbreviations: {e}", exc_info=True
-            )
+            self.logger.error(f"Error expanding sponsor abbreviations: {e}", exc_info=True)
             raise
 
     def save_processed_session_data(self) -> None:
@@ -614,3 +644,33 @@ class SessionProcessor:
         self.save_processed_session_data()
 
         self.logger.info("Session data processing workflow completed successfully")
+
+
+def main():
+    """Main function for testing the session processor."""
+    import sys
+    sys.path.insert(0, os.getcwd())
+    
+    from utils.config_utils import load_config
+    from utils.logging_utils import setup_logging
+
+    # Setup logging
+    logger = setup_logging(log_file="logs/session_processor.log")
+    
+    try:
+        # Load configuration
+        config = load_config("config/config_vet.yaml")
+        
+        # Create processor and run
+        processor = SessionProcessor(config)
+        processor.process()
+        
+        print("Session processing completed successfully!")
+        
+    except Exception as e:
+        logger.error(f"Session processing failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -79,55 +79,57 @@ class Neo4jSessionProcessor:
 
     def _test_connection(self) -> bool:
         """Test connection to Neo4j database."""
-        self.logger.info("Testing connection to Neo4j")
-        
         try:
+            self.logger.info("Testing connection to Neo4j")
             driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+            
             with driver.session() as session:
-                result = session.run("MATCH (n) RETURN count(n) as count")
-                count = result.single()["count"]
-                self.logger.info(f"Successfully connected to Neo4j. Database contains {count} nodes")
-            driver.close()
-            return True
+                result = session.run("MATCH (n) RETURN count(n) as total_nodes")
+                total_nodes = result.single()["total_nodes"]
+                self.logger.info(f"Successfully connected to Neo4j. Database contains {total_nodes} nodes")
+                return True
+                
         except Exception as e:
             self.logger.error(f"Failed to connect to Neo4j: {str(e)}")
             return False
+        finally:
+            if 'driver' in locals():
+                driver.close()
 
     def load_csv_to_neo4j(self, csv_file_path: str, node_label: str, properties_map: Dict[str, str], 
                          unique_property: str, create_only_new: bool = True) -> Tuple[int, int]:
         """
-        Load CSV data into Neo4j as nodes.
-
+        Load CSV data into Neo4j nodes.
+        
         Args:
             csv_file_path: Path to the CSV file
-            node_label: Label for the nodes to create
-            properties_map: Mapping of CSV columns to Neo4j properties
+            node_label: Label for the Neo4j nodes
+            properties_map: Mapping of CSV columns to node properties
             unique_property: Property to use for uniqueness checking
-            create_only_new: If True, only create new nodes
-
+            create_only_new: If True, only create nodes that don't exist
+            
         Returns:
             Tuple of (nodes_created, nodes_skipped)
         """
         self.logger.info(f"Loading CSV to Neo4j: {csv_file_path}")
-
+        
         nodes_created = 0
         nodes_skipped = 0
-
+        
         try:
-            # Read CSV file
+            # Load CSV data
             data = pd.read_csv(csv_file_path)
-            self.logger.info(f"Loaded CSV with {len(data)} rows")
-
+            
             driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
-
+            
             with driver.session() as session:
                 for index, row in data.iterrows():
                     try:
-                        # Build properties dictionary
+                        # Create properties dictionary
                         properties = {}
-                        for csv_col, neo4j_prop in properties_map.items():
-                            if csv_col in data.columns:
-                                properties[neo4j_prop] = str(row[csv_col]) if pd.notna(row[csv_col]) else ""
+                        for csv_col, node_prop in properties_map.items():
+                            if csv_col in row and pd.notna(row[csv_col]):
+                                properties[node_prop] = str(row[csv_col])
                         
                         # Add show attribute
                         properties['show'] = self.show_name
@@ -181,211 +183,250 @@ class Neo4jSessionProcessor:
             if 'driver' in locals():
                 driver.close()
 
-        self.logger.info(f"Nodes created: {nodes_created}, skipped: {nodes_skipped}")
+        self.logger.info(f"CSV loaded to Neo4j. Created {nodes_created} nodes, skipped {nodes_skipped} nodes")
         return nodes_created, nodes_skipped
 
-    def create_unique_streams_and_relationships(self, create_only_new: bool = True) -> Tuple[int, int, int, int]:
+    def create_stream_nodes(self, streams_file_path: str, create_only_new: bool = True) -> Tuple[int, int]:
         """
-        Create unique stream nodes and relationships between sessions and streams.
-        Fixed to match old processor's logic exactly.
-
+        Create stream nodes from JSON file.
+        FIXED: Handles both old format (dict) and new format (array) for compatibility.
+        
         Args:
-            create_only_new: If True, only create nodes and relationships that don't exist
-
+            streams_file_path: Path to the streams JSON file
+            create_only_new: If True, only create nodes that don't exist
+            
         Returns:
-            Tuple: (streams_created, streams_skipped, relationships_created, relationships_skipped)
+            Tuple of (nodes_created, nodes_skipped)
         """
-        self.logger.info("Creating unique streams and relationships")
-
-        streams_created = 0
-        streams_skipped = 0
-        tracked_created = 0
-        tracked_skipped = 0
-
+        self.logger.info(f"Creating stream nodes from: {streams_file_path}")
+        
+        nodes_created = 0
+        nodes_skipped = 0
+        
         try:
+            # Load streams data
+            with open(streams_file_path, 'r', encoding='utf-8') as f:
+                streams_data = json.load(f)
+            
+            # FIXED: Handle both old and new formats
+            streams_dict = {}
+            
+            if isinstance(streams_data, dict):
+                # Old format: {"stream_name": "description", ...}
+                streams_dict = streams_data
+                self.logger.info("Loaded streams in old format (dictionary)")
+            elif isinstance(streams_data, list):
+                # New format: [{"stream": "name", "description": "desc"}, ...]
+                for item in streams_data:
+                    if isinstance(item, dict) and 'stream' in item:
+                        stream_name = item['stream']
+                        description = item.get('description', f"Stream for {stream_name}")
+                        streams_dict[stream_name] = description
+                self.logger.info("Loaded streams in new format (array) - converted to old format")
+            else:
+                raise ValueError(f"Unexpected streams data format: {type(streams_data)}")
+            
             driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
-
+            
             with driver.session() as session:
-                # Get initial relationship count for verification
-                initial_result = session.run(
-                    "MATCH ()-[r:HAS_STREAM]->() RETURN count(r) as count"
-                )
-                initial_count = initial_result.single()["count"]
-
-                # Get all unique streams from session nodes by splitting semicolon-separated values
-                stream_query = """
-                MATCH (s)
-                WHERE s:Sessions_this_year OR s:Sessions_past_year
-                AND s.stream IS NOT NULL AND s.stream <> ''
-                RETURN DISTINCT s.stream as stream
-                """
-                
-                result = session.run(stream_query)
-                unique_streams = set()
-                
-                for record in result:
-                    stream_value = record["stream"]
-                    if stream_value:
-                        # Split by semicolon and clean each stream
-                        streams = [s.strip() for s in stream_value.split(";") if s.strip()]
-                        unique_streams.update(streams)
-
-                unique_streams = sorted(list(unique_streams))
-                self.logger.info(f"Found {len(unique_streams)} unique streams")
-
-                # Create stream nodes
-                for stream_name in unique_streams:
-                    if create_only_new:
-                        # Check if stream node already exists
-                        check_query = "MATCH (s:Stream {stream: $stream}) RETURN count(s) as count"
-                        result = session.run(check_query, stream=stream_name)
-                        if result.single()["count"] > 0:
-                            streams_skipped += 1
-                            continue
-
+                for stream_name, description in streams_dict.items():
                     try:
-                        # Create stream node with 'stream' property and show attribute (PRODUCTION STANDARD)
+                        # Check if stream already exists (only if create_only_new is True)
+                        if create_only_new:
+                            check_query = "MATCH (s:Stream {stream: $stream}) RETURN count(s) as count"
+                            result = session.run(check_query, stream=stream_name)
+                            if result.single()["count"] > 0:
+                                nodes_skipped += 1
+                                continue
+
+                        # Create stream node with 'stream', 'description', and 'show' attributes
                         create_query = """
-                        CREATE (s:Stream {stream: $stream, show: $show})
+                        CREATE (s:Stream {stream: $stream, description: $description, show: $show})
                         RETURN s
                         """
-                        session.run(create_query, stream=stream_name, show=self.show_name)
-                        streams_created += 1
+                        session.run(create_query, stream=stream_name, description=description, show=self.show_name)
+                        nodes_created += 1
+                        
                     except Exception as e:
                         self.logger.error(f"Error creating stream node '{stream_name}': {str(e)}")
                         continue
 
-                # Create relationships between sessions and streams (FIXED LOGIC - matches old processor)
-                tracked_created = 0
-                
-                # Get all sessions with their stream data
-                session_query = """
-                MATCH (s)
-                WHERE s:Sessions_this_year OR s:Sessions_past_year
-                AND s.stream IS NOT NULL AND s.stream <> ''
-                RETURN s.session_id as session_id, s.stream as stream, 
-                       CASE WHEN s:Sessions_this_year THEN 'Sessions_this_year' ELSE 'Sessions_past_year' END as session_type
+        except Exception as e:
+            self.logger.error(f"Error creating stream nodes: {str(e)}")
+            raise
+        finally:
+            if 'driver' in locals():
+                driver.close()
+
+        self.logger.info(f"Stream nodes created: {nodes_created}, skipped: {nodes_skipped}")
+        return nodes_created, nodes_skipped
+
+    def create_stream_relationships(self, session_node_label: str, stream_node_label: str, 
+                                create_only_new: bool = True) -> Tuple[int, int]:
+        """
+        Create relationships between session nodes and stream nodes.
+        SIMPLE FIX: Better relationship existence checking to prevent duplicates.
+        
+        Args:
+            session_node_label: Label of session nodes
+            stream_node_label: Label of stream nodes  
+            create_only_new: If True, only create relationships that don't exist
+            
+        Returns:
+            Tuple of (relationships_created, relationships_skipped)
+        """
+        self.logger.info(f"Creating relationships between {session_node_label} and {stream_node_label}")
+        
+        driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+        
+        # Count initial relationships for verification
+        with driver.session() as session:
+            initial_count_result = session.run(
+                f"""
+                MATCH (s:{session_node_label})-[r:HAS_STREAM]->(st:{stream_node_label})
+                RETURN COUNT(r) AS count
+                """
+            )
+            initial_count = initial_count_result.single()["count"]
+            self.logger.info(f"Initial relationship count: {initial_count}")
+
+        tracked_created = 0
+        tracked_skipped = 0
+
+        try:
+            with driver.session() as session:
+                # Get all session nodes with their stream data
+                session_query = f"""
+                MATCH (s:{session_node_label})
+                WHERE s.stream IS NOT NULL AND s.stream <> ''
+                RETURN s.session_id as session_id, s.stream as stream
                 """
                 
                 session_results = session.run(session_query)
                 
                 for session_record in session_results:
                     session_id = session_record["session_id"]
-                    session_type = session_record["session_type"]
                     streams_str = session_record["stream"]
                     
                     if not streams_str:
                         continue
                     
-                    # Split stream string by semicolon and normalize (SAME AS OLD PROCESSOR)
-                    stream_list = [
-                        stream.strip().lower() for stream in streams_str.split(";")
-                    ]
+                    # Split stream string by semicolon and normalize case
+                    streams = [s.strip().lower() for s in streams_str.split(";") if s.strip()]
                     
-                    for stream in stream_list:
+                    for stream in streams:
+                        # SIMPLE FIX: Check if relationship already exists using a more robust query
                         if create_only_new:
-                            # Check if relationship already exists
-                            check_query = f"""
-                                MATCH (s:{session_type} {{session_id: $session_id}})-[r:HAS_STREAM]->(st:Stream {{stream: $stream_name}})
-                                RETURN count(r) as count
+                            rel_exists_query = f"""
+                            MATCH (s:{session_node_label} {{session_id: $session_id}})
+                            MATCH (st:{stream_node_label})
+                            WHERE LOWER(st.stream) = $stream
+                            WITH s, st
+                            RETURN EXISTS((s)-[:HAS_STREAM]->(st)) AS exists
                             """
-                            check_result = session.run(check_query, session_id=session_id, stream_name=stream).single()
                             
-                            if check_result and check_result["count"] > 0:
+                            rel_exists_result = session.run(rel_exists_query, session_id=session_id, stream=stream)
+                            exists_record = rel_exists_result.single()
+                            
+                            if exists_record and exists_record["exists"]:
                                 tracked_skipped += 1
                                 continue
-                        
-                        # Check if both session and stream nodes exist
-                        nodes_exist_query = f"""
-                            MATCH (s:{session_type} {{session_id: $session_id}})
-                            MATCH (st:Stream {{stream: $stream_name}})
-                            RETURN COUNT(*) > 0 AS exists
-                        """
-                        nodes_exist = session.run(nodes_exist_query, session_id=session_id, stream_name=stream).single()["exists"]
-                        
-                        if not nodes_exist:
-                            # Skip if nodes don't exist (stream might not have been created due to case mismatch)
-                            self.logger.warning(f"Cannot create relationship: Session {session_id} or Stream {stream} not found")
-                            continue
-                        
-                        # Create relationship
+
+                        # BULLETPROOF: Use MERGE to create relationship only if it doesn't exist
                         create_query = f"""
-                            MATCH (s:{session_type} {{session_id: $session_id}})
-                            MATCH (st:Stream {{stream: $stream_name}})
-                            CREATE (s)-[r:HAS_STREAM]->(st)
-                            RETURN COUNT(r) AS created
+                        MATCH (s:{session_node_label} {{session_id: $session_id}})
+                        MATCH (st:{stream_node_label})
+                        WHERE LOWER(st.stream) = $stream
+                        MERGE (s)-[r:HAS_STREAM]->(st)
+                        RETURN COUNT(r) AS created
                         """
-                        
+
                         try:
-                            create_result = session.run(create_query, session_id=session_id, stream_name=stream).single()
-                            if create_result and create_result["created"] > 0:
-                                tracked_created += 1
+                            result = session.run(create_query, session_id=session_id, stream=stream).single()
+                            created_count = result["created"] if result else 0
+                            
+                            if created_count > 0:
+                                tracked_created += created_count
+                            elif created_count == 0:
+                                # Relationship already existed or nodes not found
+                                tracked_skipped += 1
+                                
                         except Exception as e:
-                            self.logger.warning(f"Error creating relationship for session {session_id} to stream {stream}: {str(e)}")
+                            self.logger.warning(f"Error creating relationship: {str(e)}")
 
-                # Get final relationship count for verification
-                final_result = session.run(
-                    "MATCH ()-[r:HAS_STREAM]->() RETURN count(r) as count"
+                # Get final relationship count to verify actual creation
+                final_count_result = session.run(
+                    f"""
+                    MATCH (s:{session_node_label})-[r:HAS_STREAM]->(st:{stream_node_label})
+                    RETURN COUNT(r) AS count
+                    """
                 )
-                final_count = final_result.single()["count"]
+                final_count = final_count_result.single()["count"]
 
-                # Calculate actual created relationships
+                # Verify counts match
                 actual_created = final_count - initial_count
-
+                
                 self.logger.info(f"Relationships: Initial={initial_count}, Final={final_count}")
                 self.logger.info(f"Tracked created={tracked_created}, Actual created={actual_created}")
-
-                # Use actual count if there's a discrepancy
-                if actual_created != tracked_created:
-                    self.logger.warning(f"Relationship count discrepancy: Tracked={tracked_created}, Actual={actual_created}")
-                    tracked_created = actual_created
+                
+                if tracked_created != actual_created:
+                    self.logger.warning(f"Relationship count mismatch! Tracked: {tracked_created}, Actual: {actual_created}")
 
         except Exception as e:
-            self.logger.error(f"Error creating streams and relationships: {str(e)}")
+            self.logger.error(f"Error creating stream relationships: {str(e)}")
             raise
         finally:
             if 'driver' in locals():
                 driver.close()
 
-        return streams_created, streams_skipped, tracked_created, tracked_skipped
+        self.logger.info(f"Relationships created: {tracked_created}, skipped: {tracked_skipped}")
+        return tracked_created, tracked_skipped
 
     def process(self, create_only_new: bool = True) -> Dict[str, Any]:
         """
         Process session data and create Neo4j nodes and relationships.
+        Replicates the old processor's exact functionality.
 
         Args:
-            create_only_new: If True, only create new nodes and relationships
+            create_only_new (bool): If True, only create nodes and relationships that don't exist.
 
         Returns:
-            Dictionary containing processing statistics
+            dict: Statistics about created and skipped nodes and relationships
         """
         self.logger.info("Starting Neo4j session and stream data processing")
 
-        # Test connection first
+        # Test the connection first
         if not self._test_connection():
-            self.logger.error("Cannot proceed with Neo4j processing due to connection failure")
+            self.logger.error("Cannot proceed with Neo4j upload due to connection failure")
             return self.statistics
 
         try:
             # Process sessions from this year
             self.logger.info("Processing sessions from this year")
-            csv_file_path = os.path.join(self.output_dir, "output", "session_this_filtered_valid_cols.csv")
-            
-            if not create_only_new:
-                # Delete existing Sessions_this_year nodes
-                self.logger.info("Recreating all Sessions_this_year nodes")
-                driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
-                with driver.session() as session:
-                    session.run("MATCH (n:Sessions_this_year) DETACH DELETE n")
-                driver.close()
-                self.logger.info("Deleted all existing Sessions_this_year nodes")
-
+            csv_file_path = os.path.join(self.output_dir, "output/session_this_filtered_valid_cols.csv")
             data = pd.read_csv(csv_file_path)
             properties_map = {col: col for col in data.columns}
             node_label = "Sessions_this_year"
 
+            # For Sessions_this_year, always recreate all nodes (delete existing ones first)
+            self.logger.info("Recreating all Sessions_this_year nodes")
+
+            # Delete existing Sessions_this_year nodes and their relationships
+            driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+            try:
+                with driver.session() as session:
+                    # Delete all Sessions_this_year nodes and their relationships
+                    delete_query = """
+                    MATCH (s:Sessions_this_year)
+                    DETACH DELETE s
+                    """
+                    session.run(delete_query)
+                    self.logger.info("Deleted all existing Sessions_this_year nodes")
+            finally:
+                driver.close()
+
             nodes_created, nodes_skipped = self.load_csv_to_neo4j(
-                csv_file_path, node_label, properties_map, "session_id", create_only_new
+                csv_file_path, node_label, properties_map, "session_id", create_only_new=False
             )
 
             self.statistics["nodes_created"]["sessions_this_year"] = nodes_created
@@ -431,32 +472,31 @@ class Neo4jSessionProcessor:
             self.statistics["nodes_created"]["sessions_past_year_lva"] = nodes_created
             self.statistics["nodes_skipped"]["sessions_past_year_lva"] = nodes_skipped
 
-            # Create unique streams and relationships
-            self.logger.info("Creating unique streams and relationships")
-            streams_created, streams_skipped, relationships_created, relationships_skipped = self.create_unique_streams_and_relationships(create_only_new)
+            # Create stream nodes
+            self.logger.info("Creating stream nodes")
+            streams_file_path = os.path.join(self.output_dir, "output/streams.json")
+            nodes_created, nodes_skipped = self.create_stream_nodes(streams_file_path, create_only_new)
 
-            self.statistics["nodes_created"]["streams"] = streams_created
-            self.statistics["nodes_skipped"]["streams"] = streams_skipped
+            self.statistics["nodes_created"]["streams"] = nodes_created
+            self.statistics["nodes_skipped"]["streams"] = nodes_skipped
 
-            # For relationships, split between this year and past year approximately
-            # This matches the old processor's statistics tracking
-            total_this_year_sessions = self.statistics["nodes_created"]["sessions_this_year"]
-            total_past_year_sessions = (self.statistics["nodes_created"]["sessions_past_year_bva"] + 
-                                      self.statistics["nodes_created"]["sessions_past_year_lva"])
-            total_sessions = total_this_year_sessions + total_past_year_sessions
-            
-            if total_sessions > 0:
-                this_year_ratio = total_this_year_sessions / total_sessions
-                self.statistics["relationships_created"]["sessions_this_year_has_stream"] = int(relationships_created * this_year_ratio)
-                self.statistics["relationships_created"]["sessions_past_year_has_stream"] = (
-                    relationships_created - self.statistics["relationships_created"]["sessions_this_year_has_stream"]
-                )
-            else:
-                self.statistics["relationships_created"]["sessions_this_year_has_stream"] = 0
-                self.statistics["relationships_created"]["sessions_past_year_has_stream"] = relationships_created
+            # Create relationships between sessions this year and streams
+            self.logger.info("Creating stream relationships for sessions this year")
+            rels_created, rels_skipped = self.create_stream_relationships(
+                "Sessions_this_year", "Stream", create_only_new
+            )
 
-            self.statistics["relationships_skipped"]["sessions_this_year_has_stream"] = 0
-            self.statistics["relationships_skipped"]["sessions_past_year_has_stream"] = relationships_skipped
+            self.statistics["relationships_created"]["sessions_this_year_has_stream"] = rels_created
+            self.statistics["relationships_skipped"]["sessions_this_year_has_stream"] = rels_skipped
+
+            # Create relationships between sessions past year and streams
+            self.logger.info("Creating stream relationships for sessions past year")
+            rels_created, rels_skipped = self.create_stream_relationships(
+                "Sessions_past_year", "Stream", create_only_new
+            )
+
+            self.statistics["relationships_created"]["sessions_past_year_has_stream"] = rels_created
+            self.statistics["relationships_skipped"]["sessions_past_year_has_stream"] = rels_skipped
 
             # Log summary
             self.logger.info("Neo4j session data processing summary:")

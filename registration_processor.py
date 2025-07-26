@@ -10,7 +10,9 @@ from pandas import json_normalize
 from fuzzywuzzy import process
 import re
 from difflib import SequenceMatcher
-
+from pandas.errors import SettingWithCopyWarning
+import warnings
+warnings.simplefilter(action="ignore", category=(SettingWithCopyWarning))
 # Configure logger
 logger = logging.getLogger(__name__)
 

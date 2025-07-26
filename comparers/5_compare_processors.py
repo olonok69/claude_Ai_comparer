@@ -143,22 +143,24 @@ class Neo4jSessionProcessorComparison:
             "nodes": {
                 "old": old_total_nodes,
                 "new": new_total_nodes,
-                "match": old_total_nodes == new_total_nodes
+                "match": old_total_nodes == new_total_nodes,
+                "difference": new_total_nodes - old_total_nodes
             },
             "relationships": {
                 "old": old_total_rels,
                 "new": new_total_rels,
-                "match": old_total_rels == new_total_rels
+                "match": old_total_rels == new_total_rels,
+                "difference": new_total_rels - old_total_rels
             }
         }
         
-        if old_total_nodes != new_total_nodes or old_total_rels != new_total_rels:
+        if not comparison["totals"]["nodes"]["match"] or not comparison["totals"]["relationships"]["match"]:
             comparison["all_identical"] = False
         
         return comparison
     
     def compare_neo4j_state(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Compare the current Neo4j database state."""
+        """Compare the actual state of Neo4j database."""
         try:
             load_dotenv(config["env_file"])
             uri = os.getenv("NEO4J_URI")
@@ -205,17 +207,23 @@ class Neo4jSessionProcessorComparison:
                 driver.close()
     
     def generate_comparison_report(self, stats_comparison: Dict, old_db_state: Dict, new_db_state: Dict) -> str:
-        """Generate a detailed comparison report."""
+        """Generate a detailed comparison report (FIXED: Uses ASCII characters for Windows compatibility)."""
+        
+        # Use ASCII characters instead of Unicode to avoid encoding issues
+        check_mark = "[OK]"
+        cross_mark = "[FAIL]"
+        success_mark = "[SUCCESS]"
+        
         report = "# Neo4j Session Processor Comparison Report\n\n"
         
         # Executive Summary
         report += "## Executive Summary\n"
         
         if stats_comparison.get("all_identical", False):
-            report += "✅ **SUCCESS**: Both processors produce identical results!\n"
-            report += "✅ The new processor is a perfect replacement for the old processor.\n\n"
+            report += f"{success_mark} **SUCCESS**: Both processors produce identical results!\n"
+            report += f"{check_mark} The new processor is a perfect replacement for the old processor.\n\n"
         else:
-            report += "❌ **FAILURE**: Processors produce different results!\n"
+            report += f"{cross_mark} **FAILURE**: Processors produce different results!\n"
             report += "⚠️ The new processor needs further fixes to match the old processor.\n\n"
         
         # Statistics Comparison
@@ -225,18 +233,18 @@ class Neo4jSessionProcessorComparison:
         report += "### Session Node Creation\n"
         for key, data in stats_comparison["nodes_created"].items():
             if key.startswith("sessions_"):
-                status = "✅ MATCH" if data["match"] else "❌ MISMATCH"
+                status = f"{check_mark} MATCH" if data["match"] else f"{cross_mark} MISMATCH"
                 report += f"- **{key}**: Old={data['old']}, New={data['new']} - {status}\n"
         
         # Stream nodes
         stream_data = stats_comparison["nodes_created"]["streams"]
-        status = "✅ MATCH" if stream_data["match"] else "❌ MISMATCH"
+        status = f"{check_mark} MATCH" if stream_data["match"] else f"{cross_mark} MISMATCH"
         report += f"- **streams**: Old={stream_data['old']}, New={stream_data['new']} - {status}\n\n"
         
         # Relationships
         report += "### Relationship Creation\n"
         for key, data in stats_comparison["relationships_created"].items():
-            status = "✅ MATCH" if data["match"] else "❌ MISMATCH"
+            status = f"{check_mark} MATCH" if data["match"] else f"{cross_mark} MISMATCH"
             report += f"- **{key}**: Old={data['old']}, New={data['new']} - {status}\n"
         
         # Database State Comparison
@@ -247,30 +255,31 @@ class Neo4jSessionProcessorComparison:
             for node_type in old_db_state["node_counts"]:
                 old_count = old_db_state["node_counts"][node_type]
                 new_count = new_db_state["node_counts"][node_type]
-                status = "✅ MATCH" if old_count == new_count else "❌ MISMATCH"
+                status = f"{check_mark} MATCH" if old_count == new_count else f"{cross_mark} MISMATCH"
                 report += f"- **{node_type}**: Old={old_count}, New={new_count} - {status}\n"
             
             report += "\n### Relationship Counts\n"
             for rel_type in old_db_state["relationship_counts"]:
                 old_count = old_db_state["relationship_counts"][rel_type]
                 new_count = new_db_state["relationship_counts"][rel_type]
-                status = "✅ MATCH" if old_count == new_count else "❌ MISMATCH"
+                status = f"{check_mark} MATCH" if old_count == new_count else f"{cross_mark} MISMATCH"
                 report += f"- **{rel_type}**: Old={old_count}, New={new_count} - {status}\n"
         
         # Totals
         report += "\n## Totals\n"
         totals = stats_comparison["totals"]
         
-        nodes_status = "✅ MATCH" if totals["nodes"]["match"] else "❌ MISMATCH"
+        nodes_status = f"{check_mark} MATCH" if totals["nodes"]["match"] else f"{cross_mark} MISMATCH"
         report += f"- **Total Nodes**: Old={totals['nodes']['old']}, New={totals['nodes']['new']} - {nodes_status}\n"
         
-        rels_status = "✅ MATCH" if totals["relationships"]["match"] else "❌ MISMATCH"
+        rels_status = f"{check_mark} MATCH" if totals["relationships"]["match"] else f"{cross_mark} MISMATCH"
         report += f"- **Total Relationships**: Old={totals['relationships']['old']}, New={totals['relationships']['new']} - {rels_status}\n"
         
         return report
     
     def run_comparison(self, old_config_path: str, new_config_path: str) -> bool:
         """Run the complete comparison between processors."""
+        
         try:
             # Load configurations
             self.logger.info("Loading configurations...")
@@ -308,9 +317,10 @@ class Neo4jSessionProcessorComparison:
             # Generate report
             report = self.generate_comparison_report(stats_comparison, old_db_state, new_db_state)
             
-            # Save results
+            # Save results (FIXED: Added UTF-8 encoding and ensure_ascii=False)
+            os.makedirs("logs", exist_ok=True)
             report_path = "logs/neo4j_session_processor_comparison_report.md"
-            with open(report_path, 'w') as f:
+            with open(report_path, 'w', encoding='utf-8') as f:
                 f.write(report)
             
             comparison_data_path = "logs/neo4j_session_processor_comparison_data.json"
@@ -319,24 +329,24 @@ class Neo4jSessionProcessorComparison:
                 "old_db_state": old_db_state,
                 "new_db_state": new_db_state
             }
-            with open(comparison_data_path, 'w') as f:
-                json.dump(comparison_data, f, indent=2)
+            with open(comparison_data_path, 'w', encoding='utf-8') as f:
+                json.dump(comparison_data, f, indent=2, ensure_ascii=False)
             
-            # Print results
+            # Print results (FIXED: Use ASCII characters for console output)
             print("\n" + "=" * 80)
-            print("🔍 COMPARISON RESULTS")
+            print("COMPARISON RESULTS")
             print("=" * 80)
             
             success = stats_comparison.get("all_identical", False)
             
             if success:
-                print("🎉 SUCCESS: Both processors produce IDENTICAL results!")
-                print("✅ Session nodes match exactly")
-                print("✅ Stream nodes match exactly") 
-                print("✅ Relationships match exactly")
-                print("✅ The new processor is a perfect replacement!")
+                print("[SUCCESS] Both processors produce IDENTICAL results!")
+                print("[OK] Session nodes match exactly")
+                print("[OK] Stream nodes match exactly") 
+                print("[OK] Relationships match exactly")
+                print("[OK] The new processor is a perfect replacement!")
             else:
-                print("❌ FAILURE: Processors produce DIFFERENT results!")
+                print("[FAIL] Processors produce DIFFERENT results!")
                 
                 # Show specific mismatches
                 if not all(data["match"] for data in stats_comparison["nodes_created"].values()):
@@ -352,7 +362,7 @@ class Neo4jSessionProcessorComparison:
             
         except Exception as e:
             self.logger.error(f"Comparison failed: {e}", exc_info=True)
-            print(f"\n❌ ERROR: {e}")
+            print(f"\n[ERROR] {e}")
             return False
 
 

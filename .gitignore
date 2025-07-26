@@ -94,7 +94,7 @@ coverage.xml
 # Jupyter Notebook
 .ipynb_checkpoints
 
-data/
+
 logs/
 comparison_output/
 comparison_output_scan/

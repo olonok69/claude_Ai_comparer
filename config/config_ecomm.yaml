@@ -73,7 +73,7 @@ output_files:
 # Pipeline control settings (SAME AS VET)
 create_only_new: false  # If true, only process new visitors without recommendations
 
-# Pipeline step activation settings - UPDATED FOR NEO4J PROCESSING
+# Pipeline step activation settings - UPDATED FOR NEO4J SESSION PROCESSING
 pipeline_steps:
   # Data processing steps
   registration_processing: true
@@ -81,7 +81,7 @@ pipeline_steps:
   session_processing: true
   # Neo4j processing steps
   neo4j_visitor_processing: true
-  neo4j_session_processing: false
+  neo4j_session_processing: true  # ENABLED: Added Neo4j session processing
   neo4j_job_stream_processing: false
   neo4j_specialization_stream_processing: false
   neo4j_visitor_relationship_processing: false
@@ -123,7 +123,8 @@ session_files:
 
 # Stream processing configuration (SAME AS VET)
 stream_processing:
-  use_cached_descriptions: true   # Set to true to use cached descriptions when available
+  use_cached_descriptions: true
+  # Set to true to use cached descriptions when available
 
 # Session processor output file configuration
 session_output_files:
@@ -175,7 +176,8 @@ recommendation:
 neo4j:
   uri: "neo4j+s://928872b4.databases.neo4j.io"
   username: "neo4j"
-  password: ""  
+  password: "VP4k_l8F84CTayWGT2N0fQflhdThZqDAE_XyNaUNAwM"
+  show_name: "ecomm"  # ADDED: Show attribute for ECOMM nodes
   node_labels:
     visitor_this_year: "Visitor_this_year"
     visitor_last_year_bva: "Visitor_last_year_bva"
