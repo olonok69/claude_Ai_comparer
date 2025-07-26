@@ -129,8 +129,8 @@ stream_processing:
 session_output_files:
   processed_sessions:
     this_year: "session_this_filtered_valid_cols.csv"
-    last_year_main: "session_last_filtered_valid_cols_bva.csv"      # ECE data
-    last_year_secondary: "session_last_filtered_valid_cols_lva.csv"  # TFM data
+    last_year_main: "session_last_filtered_valid_cols_ecomm.csv"   # Changed from bva to ecomm
+    last_year_secondary: "session_last_filtered_valid_cols_tfm.csv"  # Changed from lva to tfm
   streams_catalog: "streams.json"
   
 # Session processing configuration (SAME STRUCTURE)
