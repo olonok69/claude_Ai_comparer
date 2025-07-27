@@ -1,4 +1,3 @@
-#exclude files and directories from version control
 # Environment variables
 .env
 .env.local
@@ -6,7 +5,10 @@
 
 # Authentication and security files
 keys/
-
+*.yaml
+*.yml
+config.yaml
+config.yml
 
 # SSL certificates and private keys
 ssl/
@@ -61,7 +63,7 @@ ehthumbs.db
 Thumbs.db
 
 # Logs
-
+*.log
 logs/
 
 # Docker
@@ -94,8 +96,4 @@ coverage.xml
 
 # Jupyter Notebook
 .ipynb_checkpoints
-
-
-logs/
-comparison_output/
-comparison_output_scan/
+outputs/
