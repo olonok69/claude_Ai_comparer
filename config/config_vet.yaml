@@ -221,6 +221,7 @@ neo4j:
     attended_session: "attended_session"  # Relationship between visitors and sessions they attended
   job_stream_mapping:
     file: "job_to_stream.csv"  # File containing job to stream mappings
+    job_role_field: "job_role"
   specialization_stream_mapping:
     file: "spezialization_to_stream.csv"  # File containing specialization to stream mappings
     specialization_map: {

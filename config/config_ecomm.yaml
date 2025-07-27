@@ -197,8 +197,9 @@ neo4j:
     attended_session: "attended_session"  # Relationship between visitors and sessions they attended
   job_stream_mapping:
     file: "job_to_stream.csv"  # File containing job to stream mappings
+    job_role_field: "what_is_your_job_role"
   specialization_stream_mapping:
-    file: "spezialization_to_stream.csv"  # File containing specialization to stream mappings
+    file: "specialization_to_stream.csv"  # File containing specialization to stream mapping
     specialization_map: {
       # ECOMM-specific specialization mapping (different from vet)
       "B2B": "Business",

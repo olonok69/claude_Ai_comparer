@@ -1,3 +1,4 @@
+#exclude files and directories from version control
 # Environment variables
 .env
 .env.local
@@ -60,7 +61,7 @@ ehthumbs.db
 Thumbs.db
 
 # Logs
-*.log
+
 logs/
 
 # Docker
