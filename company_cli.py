@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced Company Classification CLI Tool
-Integrates Perplexity logic with improved search strategy and maintains Google functionality.
+Enhanced Company Classification CLI Tool with CSV Sanitization
+Classifies companies using multiple MCP servers (Google Search + Perplexity) with Excel-compatible CSV output.
 """
 
 import argparse
@@ -9,287 +9,181 @@ import asyncio
 import csv
 import json
 import os
+import re
 import sys
 import time
-import pickle
 import traceback
-import shutil
-import tempfile
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime
-import re
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple, Any
 
-# Add the client directory to the path so we can import existing modules
+# Add the client directory to the path
 sys.path.insert(0, str(Path(__file__).parent / "client"))
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from client.services.ai_service import create_llm_model
-from client.services.mcp_service import setup_mcp_client, get_tools_from_client, prepare_server_config
-from langgraph.prebuilt import create_react_agent
-from client.config import SERVER_CONFIG, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS
+
+# Import MCP components
+from services.mcp_service import MCPService
+from services.llm_service import LLMService
+from utils.config_manager import ConfigManager
 
 # Load environment variables
 load_dotenv()
 
+
 class ProgressTracker:
-    """COMPLETELY FIXED progress tracker with immediate saves and atomic operations."""
+    """Enhanced progress tracker with atomic saves and comprehensive error handling."""
     
     def __init__(self, output_base: str):
         self.output_base = output_base
-        self.progress_file = f"{output_base}_progress.pkl"
+        self.progress_file = f"{output_base}_progress.json"
         self.temp_results_file = f"{output_base}_temp_results.json"
-        self.error_log_file = f"{output_base}_errors.log"
+        self.error_log_file = f"{output_base}_errors.json"
         
-        # Progress tracking
+        # State tracking
         self.processed_batches = set()
         self.failed_batches = set()
-        self.all_data_rows = []  # Store only data rows, no headers
-        self.header_row = None   # Store header separately
-        self.total_batches = 0
-        self.start_time = time.time()  # FIX: Initialize immediately
-        self.last_save_time = None
-        
-        # Error tracking
+        self.all_data_rows = []
+        self.header_row = None
         self.error_count = 0
         self.consecutive_errors = 0
-        self.max_consecutive_errors = 3
+        self.max_consecutive_errors = 5
+        self.total_batches = 0
+        self.start_time = time.time()
         
-        # FIX: Ensure output directory exists
-        output_dir = Path(self.output_base).parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"📁 ProgressTracker initialized for: {output_base}")
-        print(f"   📄 Progress file: {self.progress_file}")
-        print(f"   📄 Temp results: {self.temp_results_file}")
-        print(f"   📄 Error log: {self.error_log_file}")
+        # Load existing progress
+        self.load_progress()
     
-    def save_progress(self):
-        """FIXED: Save current progress to disk with atomic operations and proper error handling."""
+    def load_progress(self):
+        """Load existing progress from disk."""
         try:
-            # Prepare progress data with JSON-compatible types
+            if os.path.exists(self.progress_file):
+                with open(self.progress_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                self.processed_batches = set(data.get('processed_batches', []))
+                self.failed_batches = set(data.get('failed_batches', []))
+                self.error_count = data.get('error_count', 0)
+                self.consecutive_errors = data.get('consecutive_errors', 0)
+                self.total_batches = data.get('total_batches', 0)
+                self.start_time = data.get('start_time', time.time())
+                
+                print(f"📂 Loaded previous progress: {len(self.processed_batches)} completed batches")
+            
+            # Load temp results
+            if os.path.exists(self.temp_results_file):
+                with open(self.temp_results_file, 'r', encoding='utf-8') as f:
+                    temp_data = json.load(f)
+                
+                self.all_data_rows = temp_data.get('data_rows', [])
+                self.header_row = temp_data.get('header_row')
+                
+                print(f"📂 Loaded {len(self.all_data_rows)} previous results")
+                
+        except Exception as e:
+            print(f"⚠️  Error loading progress: {e}")
+            print("🔄 Starting fresh")
+    
+    def save_progress(self) -> bool:
+        """Save current progress with atomic operations."""
+        try:
+            # Save main progress
             progress_data = {
-                'processed_batches': list(self.processed_batches),  # FIX: Convert set to list
-                'failed_batches': list(self.failed_batches),        # FIX: Convert set to list
-                'all_data_rows': self.all_data_rows,
-                'header_row': self.header_row,
+                'processed_batches': list(self.processed_batches),
+                'failed_batches': list(self.failed_batches),
+                'error_count': self.error_count,
+                'consecutive_errors': self.consecutive_errors,
                 'total_batches': self.total_batches,
                 'start_time': self.start_time,
-                'error_count': self.error_count,
-                'last_save_time': time.time()  # FIX: Use time.time() instead of datetime
+                'last_update': time.time()
             }
             
-            # FIX: Atomic save for progress file using temporary file
-            temp_progress_file = f"{self.progress_file}.tmp"
-            try:
-                with open(temp_progress_file, 'wb') as f:
-                    pickle.dump(progress_data, f)
-                # Atomic move
-                shutil.move(temp_progress_file, self.progress_file)
-                print(f"   💾 Progress saved to: {self.progress_file}")
-            except Exception as e:
-                # Clean up temp file if it exists
-                if os.path.exists(temp_progress_file):
-                    os.remove(temp_progress_file)
-                raise e
+            # Atomic save for progress
+            temp_progress = f"{self.progress_file}.tmp"
+            with open(temp_progress, 'w', encoding='utf-8') as f:
+                json.dump(progress_data, f, indent=2)
             
-            # FIX: Atomic save for human-readable results
-            if self.header_row and self.all_data_rows:
-                all_results = [self.header_row] + self.all_data_rows
-                temp_results_file = f"{self.temp_results_file}.tmp"
-                try:
-                    with open(temp_results_file, 'w', encoding='utf-8') as f:
-                        json.dump(all_results, f, indent=2, ensure_ascii=False)
-                    # Atomic move
-                    shutil.move(temp_results_file, self.temp_results_file)
-                    print(f"   💾 Temp results saved: {len(all_results)} rows")
-                except Exception as e:
-                    # Clean up temp file if it exists
-                    if os.path.exists(temp_results_file):
-                        os.remove(temp_results_file)
-                    raise e
+            os.replace(temp_progress, self.progress_file)
             
-            self.last_save_time = time.time()
+            # Save temp results
+            temp_data = {
+                'header_row': self.header_row,
+                'data_rows': self.all_data_rows,
+                'last_update': time.time()
+            }
+            
+            temp_results = f"{self.temp_results_file}.tmp"
+            with open(temp_results, 'w', encoding='utf-8') as f:
+                json.dump(temp_data, f, indent=2, ensure_ascii=False)
+            
+            os.replace(temp_results, self.temp_results_file)
+            
             return True
             
-        except PermissionError as e:
-            print(f"❌ Permission error saving progress: {e}")
-            print(f"   Check write permissions for: {Path(self.output_base).parent}")
-            return False
-        except OSError as e:
-            print(f"❌ OS error saving progress: {e}")
-            print(f"   Check disk space and file system permissions")
-            return False
         except Exception as e:
-            print(f"❌ Unexpected error saving progress: {e}")
-            print(f"   Traceback: {traceback.format_exc()}")
+            print(f"❌ Error saving progress: {e}")
             return False
     
-    def load_progress(self) -> bool:
-        """FIXED: Load existing progress if available with proper error handling."""
-        if not os.path.exists(self.progress_file):
-            print(f"📂 No existing progress file found: {self.progress_file}")
-            return False
-            
-        try:
-            with open(self.progress_file, 'rb') as f:
-                data = pickle.load(f)
-                
-            # FIX: Convert lists back to sets for internal processing
-            self.processed_batches = set(data.get('processed_batches', []))
-            self.failed_batches = set(data.get('failed_batches', []))
-            self.all_data_rows = data.get('all_data_rows', [])
-            self.header_row = data.get('header_row', None)
-            self.total_batches = data.get('total_batches', 0)
-            self.start_time = data.get('start_time', time.time())  # FIX: Fallback to current time
-            self.error_count = data.get('error_count', 0)
-            
-            print(f"📥 Progress loaded successfully:")
-            print(f"   ✅ Processed batches: {len(self.processed_batches)}")
-            print(f"   ❌ Failed batches: {len(self.failed_batches)}")
-            print(f"   📊 Data rows: {len(self.all_data_rows)}")
-            print(f"   📋 Header: {'Yes' if self.header_row else 'No'}")
-            print(f"   🔢 Total batches: {self.total_batches}")
-            return True
-            
-        except (pickle.PickleError, EOFError) as e:
-            print(f"❌ Error loading progress file (corrupted): {e}")
-            print(f"   Moving corrupted file to: {self.progress_file}.corrupted")
-            try:
-                shutil.move(self.progress_file, f"{self.progress_file}.corrupted")
-            except:
-                pass
-            return False
-        except Exception as e:
-            print(f"❌ Unexpected error loading progress: {e}")
-            return False
-    
-    def mark_batch_completed(self, batch_num: int, parsed_rows: List[List[str]]):
-        """FIXED: Mark a batch as completed and save results with immediate persistence."""
-        print(f"   ✅ Marking batch {batch_num} as completed...")
-        
+    def mark_batch_completed(self, batch_num: int, results: List[List[str]]):
+        """Mark a batch as completed and save results."""
         self.processed_batches.add(batch_num)
-        self.failed_batches.discard(batch_num)
+        self.consecutive_errors = 0  # Reset on success
         
-        # Extract header and data rows
-        batch_header, data_rows = self.extract_header_and_data(parsed_rows)
+        # Add results to collection
+        if results:
+            header, data_rows = self.extract_header_and_data(results)
+            
+            if header and self.header_row is None:
+                self.header_row = header
+            
+            if data_rows:
+                self.all_data_rows.extend(data_rows)
         
-        # Set header if we don't have one yet
-        if self.header_row is None and batch_header is not None:
-            self.header_row = batch_header
-            print(f"   📋 Header captured: {len(batch_header)} columns")
-        
-        # Add data rows (no headers)
-        if data_rows:
-            self.all_data_rows.extend(data_rows)
-            print(f"   📊 Added {len(data_rows)} data rows (total: {len(self.all_data_rows)})")
-        
-        self.consecutive_errors = 0
-        
-        # FIX: Save progress after EVERY batch completion (not just every 10)
-        print(f"   💾 Saving progress for batch {batch_num}...")
-        save_success = self.save_progress()
-        
-        if not save_success:
-            print(f"   ⚠️  Warning: Failed to save progress for batch {batch_num}")
-            print(f"   📊 Current state: {len(self.processed_batches)} completed, {len(self.all_data_rows)} rows")
-            # FIX: Try alternative save method
-            try:
-                self.force_save_alternative()
-            except Exception as e:
-                print(f"   ❌ Alternative save also failed: {e}")
-        else:
-            print(f"   ✅ Progress saved successfully for batch {batch_num}")
+        # Immediate save after each batch
+        self.save_progress()
     
-    def mark_batch_failed(self, batch_num: int, error: str, traceback_str: str = ""):
-        """FIXED: Mark a batch as failed and log the error with immediate persistence."""
-        print(f"   ❌ Marking batch {batch_num} as failed...")
-        
+    def mark_batch_failed(self, batch_num: int):
+        """Mark a batch as failed."""
         self.failed_batches.add(batch_num)
         self.error_count += 1
         self.consecutive_errors += 1
         
-        # Log error immediately
-        self.log_error(batch_num, error, traceback_str)
-        
-        # FIX: Save progress immediately after marking failure
-        print(f"   💾 Saving progress after batch {batch_num} failure...")
-        save_success = self.save_progress()
-        
-        if not save_success:
-            print(f"   ⚠️  Warning: Failed to save progress after batch {batch_num} failure")
-            # FIX: Try alternative save method
-            try:
-                self.force_save_alternative()
-            except Exception as e:
-                print(f"   ❌ Alternative save also failed: {e}")
-        else:
-            print(f"   ✅ Progress saved after failure for batch {batch_num}")
+        # Save progress immediately
+        self.save_progress()
     
-    def force_save_alternative(self):
-        """Alternative save method using a different approach."""
-        try:
-            # Create a minimal save data structure
-            minimal_data = {
-                'processed': list(self.processed_batches),
-                'failed': list(self.failed_batches),
-                'rows': len(self.all_data_rows),
-                'total': self.total_batches,
-                'timestamp': time.time()
-            }
+    def extract_header_and_data(self, results: List[List[str]]) -> Tuple[Optional[List[str]], List[List[str]]]:
+        """Extract header and data rows from results."""
+        if not results:
+            return None, []
+        
+        header = None
+        data_rows = []
+        
+        for row in results:
+            if not row or len(row) == 0:
+                continue
             
-            backup_file = f"{self.output_base}_backup.json"
-            with open(backup_file, 'w') as f:
-                json.dump(minimal_data, f)
+            # Check if this is a header row
+            if self.is_header_row(row):
+                if header is None:
+                    header = row
+                continue
             
-            print(f"   🔄 Alternative save completed: {backup_file}")
-            return True
-        except Exception as e:
-            print(f"   ❌ Alternative save also failed: {e}")
-            return False
-    
-    def log_error(self, batch_num: int, error: str, traceback_str: str = ""):
-        """Log an error to the error log file with atomic write."""
-        try:
-            error_entry = f"\n{'='*50}\n"
-            error_entry += f"Batch {batch_num} Error - {datetime.now().isoformat()}\n"
-            error_entry += f"Error: {error}\n"
-            if traceback_str:
-                error_entry += f"Traceback:\n{traceback_str}\n"
-            error_entry += f"{'='*50}\n"
+            # Check if this is a separator row
+            if self.is_separator_row(row):
+                continue
             
-            # FIX: Atomic write for error log
-            temp_error_file = f"{self.error_log_file}.tmp"
-            try:
-                # Append to existing content
-                existing_content = ""
-                if os.path.exists(self.error_log_file):
-                    with open(self.error_log_file, 'r', encoding='utf-8') as f:
-                        existing_content = f.read()
-                
-                with open(temp_error_file, 'w', encoding='utf-8') as f:
-                    f.write(existing_content + error_entry)
-                
-                # Atomic move
-                shutil.move(temp_error_file, self.error_log_file)
-                print(f"   📝 Error logged for batch {batch_num}")
-                
-            except Exception as e:
-                # Clean up temp file if it exists
-                if os.path.exists(temp_error_file):
-                    os.remove(temp_error_file)
-                raise e
-                
-        except Exception as e:
-            print(f"⚠️  Error writing to error log: {e}")
+            # This is a data row
+            if any(cell.strip() for cell in row):
+                data_rows.append(row)
+        
+        return header, data_rows
     
     def is_header_row(self, row: List[str]) -> bool:
         """Check if a row is a header row."""
         if not row or len(row) == 0:
             return False
         
-        # Check for common header indicators
         first_cell = row[0].lower().strip()
         header_indicators = [
             'company name', 'account name', 'trading name', 
@@ -299,40 +193,11 @@ class ProgressTracker:
         return any(indicator in first_cell for indicator in header_indicators)
     
     def is_separator_row(self, row: List[str]) -> bool:
-        """Check if a row is a markdown separator row (contains only dashes)."""
+        """Check if a row is a markdown separator row."""
         if not row:
             return False
         
         return all(cell.strip() == '' or all(c in '-|: ' for c in cell.strip()) for cell in row)
-    
-    def extract_header_and_data(self, parsed_rows: List[List[str]]) -> Tuple[Optional[List[str]], List[List[str]]]:
-        """Extract header and data rows from parsed table."""
-        if not parsed_rows:
-            return None, []
-        
-        header = None
-        data_rows = []
-        
-        for row in parsed_rows:
-            if not row or len(row) == 0:
-                continue
-            
-            # Skip separator rows
-            if self.is_separator_row(row):
-                continue
-            
-            # Identify header row
-            if self.is_header_row(row):
-                if header is None:  # Take the first header we find
-                    header = row
-                # Skip subsequent headers (duplicates)
-                continue
-            
-            # This is a data row
-            if row and any(cell.strip() for cell in row):  # Has some content
-                data_rows.append(row)
-        
-        return header, data_rows
     
     def should_stop_due_to_errors(self) -> bool:
         """Check if we should stop due to too many consecutive errors."""
@@ -351,8 +216,7 @@ class ProgressTracker:
         return [self.header_row] + self.all_data_rows
     
     def get_stats(self) -> Dict:
-        """Get current processing statistics with corrected calculations."""
-        # Calculate valid batches (only those within current total_batches)
+        """Get current processing statistics."""
         valid_completed = len([b for b in self.processed_batches if b <= self.total_batches])
         valid_failed = len([b for b in self.failed_batches if b <= self.total_batches])
         
@@ -366,9 +230,7 @@ class ProgressTracker:
             'success_rate': valid_completed / max(1, self.total_batches) * 100,
             'total_data_rows': len(self.all_data_rows),
             'has_header': self.header_row is not None,
-            'elapsed_time': time.time() - self.start_time if self.start_time else 0,
-            'all_processed_batches': len(self.processed_batches),  # For debugging
-            'all_failed_batches': len(self.failed_batches)  # For debugging
+            'elapsed_time': time.time() - self.start_time if self.start_time else 0
         }
     
     def cleanup_temp_files(self):
@@ -394,7 +256,7 @@ class ProgressTracker:
         print(f"🧹 Cleaned up {cleaned_count} temporary files")
     
     def force_save(self):
-        """Force an immediate save of current progress (useful for debugging)."""
+        """Force an immediate save of current progress."""
         print("🔄 Forcing immediate progress save...")
         success = self.save_progress()
         if success:
@@ -414,7 +276,7 @@ class EnhancedCompanyClassificationCLI:
         self.enabled_servers = enabled_servers or {"google", "company_tagging"}
         self.output_base = output_base
         
-        # Initialize progress tracker with fixed implementation
+        # Initialize progress tracker
         self.progress = ProgressTracker(output_base)
         
         # MCP components
@@ -432,9 +294,7 @@ class EnhancedCompanyClassificationCLI:
         self.companies = []
         self.retry_delay = 5
         self.max_retries = 3
-        
-        # Don't set recursion limit here - wait until after LLM initialization
-        
+    
     def sanitize_json_string(self, text: str) -> str:
         """Sanitize a string to prevent JSON parsing errors."""
         if not isinstance(text, str):
@@ -450,6 +310,30 @@ class EnhancedCompanyClassificationCLI:
         
         # Remove other control characters except common ones
         text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', text)
+        
+        return text
+    
+    def sanitize_csv_field(self, text: str) -> str:
+        """
+        Sanitize CSV field content to prevent Excel formatting issues.
+        Specifically handles Account Name and Trading Name columns.
+        """
+        if not isinstance(text, str):
+            return str(text)
+        
+        # Remove or escape characters that cause Excel CSV parsing issues
+        text = text.replace(',', ';')  # Replace commas with semicolons
+        text = text.replace('\\', '/')  # Replace backslashes with forward slashes
+        text = text.replace('"', "'")  # Replace double quotes with single quotes
+        text = text.replace('\r', ' ')  # Replace carriage returns with spaces
+        text = text.replace('\n', ' ')  # Replace newlines with spaces
+        text = text.replace('\t', ' ')  # Replace tabs with spaces
+        
+        # Remove control characters that can break CSV parsing
+        text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', text)
+        
+        # Trim whitespace
+        text = text.strip()
         
         return text
     
@@ -526,104 +410,82 @@ class EnhancedCompanyClassificationCLI:
     
     def get_server_config(self) -> Dict[str, Dict]:
         """Get server configuration based on enabled servers."""
-        if os.path.exists(self.config_path):
-            with open(self.config_path, 'r') as f:
-                server_config = json.load(f)
-            all_servers = server_config.get('mcpServers', {})
-        else:
-            all_servers = SERVER_CONFIG['mcpServers']
+        config = {}
         
-        filtered_servers = {}
+        if "google" in self.enabled_servers:
+            config["Google Search"] = {
+                "transport": "sse",
+                "url": "http://localhost:8002/sse"
+            }
         
-        # Company Tagging is always included
-        if "Company Tagging" in all_servers:
-            filtered_servers["Company Tagging"] = all_servers["Company Tagging"]
+        if "perplexity" in self.enabled_servers:
+            config["Perplexity"] = {
+                "transport": "sse", 
+                "url": "http://localhost:8001/sse"
+            }
         
-        # Add Google Search if enabled
-        if "google" in self.enabled_servers and "Google Search" in all_servers:
-            filtered_servers["Google Search"] = all_servers["Google Search"]
+        if "company_tagging" in self.enabled_servers:
+            config["Company Tagging"] = {
+                "transport": "stdio",
+                "command": "python",
+                "args": ["-m", "mcp_servers.company_tagging.server"],
+                "env": {
+                    "PERPLEXITY_API_KEY": os.getenv("PERPLEXITY_API_KEY", ""),
+                    "PERPLEXITY_MODEL": os.getenv("PERPLEXITY_MODEL", "llama-3.1-sonar-large-128k-online")
+                }
+            }
         
-        # Add Perplexity Search if enabled
-        if "perplexity" in self.enabled_servers and "Perplexity Search" in all_servers:
-            filtered_servers["Perplexity Search"] = all_servers["Perplexity Search"]
-        
-        return filtered_servers
+        return config
     
     async def setup_connections(self):
-        """Set up MCP client connections and initialize the agent."""
-        print("🔧 Setting up MCP connections...")
-        
-        if not self.validate_server_requirements():
-            raise ValueError("Missing required environment variables")
-        
-        # Create LLM instance first (before setting recursion limit)
-        if self._has_azure_credentials():
-            llm_provider = "Azure OpenAI"
-        else:
-            llm_provider = "OpenAI"
-        
+        """Setup MCP connections and LLM service."""
         try:
-            self.llm = create_llm_model(
-                llm_provider,
-                temperature=DEFAULT_TEMPERATURE,
-                max_tokens=DEFAULT_MAX_TOKENS
-            )
-            print(f"✅ LLM initialized: {llm_provider}")
+            # Validate environment first
+            if not self.validate_server_requirements():
+                raise ValueError("Missing required environment variables")
+            
+            # Setup LLM service
+            self.llm = LLMService()
+            print("✅ LLM service initialized")
+            
+            # Get server configuration
+            server_config = self.get_server_config()
+            
+            # Save configuration file
+            with open(self.config_path, 'w') as f:
+                json.dump(server_config, f, indent=2)
+            
+            print(f"💾 Server configuration saved to: {self.config_path}")
+            
+            # Setup MCP client
+            config_manager = ConfigManager(self.config_path)
+            self.client = MCPService(config_manager)
+            
+            # Initialize connections
+            await self.client.initialize()
+            print("✅ MCP connections established")
+            
+            # Get available tools
+            self.tools = await self.client.get_available_tools()
+            
+            # Organize tools by server
+            for tool in self.tools:
+                server_name = getattr(tool, 'server_name', 'unknown')
+                if 'google' in server_name.lower():
+                    self.available_tools["google"].append(tool)
+                elif 'perplexity' in server_name.lower():
+                    self.available_tools["perplexity"].append(tool)
+                elif 'company' in server_name.lower() or 'tagging' in server_name.lower():
+                    self.available_tools["company_tagging"].append(tool)
+            
+            print(f"🔧 Available tools:")
+            for server, tools in self.available_tools.items():
+                if tools:
+                    print(f"   {server}: {len(tools)} tools")
+            
         except Exception as e:
-            raise ValueError(f"Failed to initialize LLM: {e}")
-        
-        # Skip recursion limit adjustment - use system default
-        current_limit = sys.getrecursionlimit()
-        print(f"🔄 Using system recursion limit: {current_limit}")
-        
-        # Get server configuration
-        try:
-            servers = self.get_server_config()
-            prepared_servers = prepare_server_config(servers)
-            
-            print(f"🔌 Connecting to {len(prepared_servers)} MCP servers...")
-            
-            self.client = await setup_mcp_client(prepared_servers)
-            self.tools = await get_tools_from_client(self.client)
-            
-            # Categorize tools
-            self.available_tools = self.categorize_tools(self.tools)
-            
-            # Create agent
-            self.agent = create_react_agent(self.llm, self.tools)
-            
-            print(f"✅ Initialized with {len(self.tools)} available tools")
-            
-        except Exception as e:
-            print(f"❌ MCP Connection Error: {str(e)}")
-            raise ValueError(f"Failed to setup MCP connections: {e}")
-    
-    def categorize_tools(self, tools: List) -> Dict[str, List]:
-        """Categorize tools by server type."""
-        categorized = {
-            "google": [],
-            "perplexity": [],
-            "company_tagging": []
-        }
-        
-        for tool in tools:
-            tool_name = tool.name.lower()
-            tool_desc = tool.description.lower() if hasattr(tool, 'description') and tool.description else ""
-            
-            if any(keyword in tool_name for keyword in [
-                'search_show_categories', 'company_tagging', 'tag_companies'
-            ]):
-                categorized["company_tagging"].append(tool)
-            elif any(keyword in tool_name for keyword in [
-                'perplexity_search_web', 'perplexity_advanced_search', 'perplexity'
-            ]):
-                categorized["perplexity"].append(tool)
-            elif any(keyword in tool_name for keyword in [
-                'google-search', 'read-webpage', 'google_search'
-            ]):
-                categorized["google"].append(tool)
-        
-        return categorized
+            print(f"❌ Error setting up connections: {e}")
+            raise
     
     def read_csv_file(self, csv_path: str) -> List[Dict]:
         """Read and parse the CSV file."""
@@ -679,93 +541,30 @@ class EnhancedCompanyClassificationCLI:
         return '\n\n'.join(formatted_lines)
     
     def create_research_prompt(self, companies_batch: List[Dict]) -> str:
-        """Create research prompt for the batch with enhanced server-specific strategy and tech context."""
-        company_data = self.format_companies_for_analysis(companies_batch)
+        """Create research prompt for the batch."""
+        companies_text = self.format_companies_for_analysis(companies_batch)
         
-        # Determine available search tools
-        has_google = len(self.available_tools["google"]) > 0
-        has_perplexity = len(self.available_tools["perplexity"]) > 0
-        
-        # Build research instructions based on available tools
-        research_instructions = []
-        
-        if has_google and has_perplexity:
-            # Both available - use both for comprehensive research
-            research_instructions.extend([
-                "   - Use google-search tool: If domain exists and is not empty, use \"site:[domain] technology platform software cloud AI data\", otherwise use \"[company name] technology software platform services\"",
-                "   - Use perplexity_advanced_search tool with recency=\"year\": \"[company name] [Industry if available] [Product/Service Type if available] technology platform software services\"",
-                "   - Combine insights from both searches for comprehensive understanding"
-            ])
-            tool_requirements = "- MUST use BOTH google-search AND perplexity_advanced_search for each company"
-        elif has_perplexity:
-            # Only Perplexity available
-            research_instructions.append("   - Use perplexity_advanced_search tool with recency=\"year\": \"[company name] [Industry if available] [Product/Service Type if available] technology platform software services\"")
-            tool_requirements = "- MUST use perplexity_advanced_search for each company with recency=\"year\""
-        elif has_google:
-            # Only Google available
-            research_instructions.append("   - Use google-search tool: If domain exists and is not empty, use \"site:[domain] technology platform software cloud AI data\", otherwise use \"[company name] technology software platform services\"")
-            tool_requirements = "- MUST use google-search tool for each company"
-        else:
-            # No search tools available
-            research_instructions.append("   - No web search tools available - use available knowledge and company tagging tools only")
-            tool_requirements = "- No web search tools available - proceed with taxonomy matching based on available information"
-        
-        return f"""You are a professional data analyst tasked with tagging exhibitor companies with accurate industry and product categories from our established taxonomy.
+        prompt = f"""
+You are a data analyst specializing in technology company classification for trade shows. 
 
-    IMPORTANT CONTEXT: All companies in this dataset are TECHNOLOGY COMPANIES that exhibit at tech trade shows. They all operate in the technology sector, even if their names might not immediately suggest it.
+TASK: Research and classify the following companies for technology trade shows (CAI, DOL, CCSE, BDAIW, DCW).
 
-    COMPANY DATA TO ANALYZE:
-    {company_data}
+COMPANIES TO RESEARCH:
+{companies_text}
 
-    MANDATORY RESEARCH PROCESS:
+INSTRUCTIONS:
+1. Research each company thoroughly using available tools
+2. Focus on their core technology products/services
+3. Classify using the official taxonomy categories
+4. Provide up to 4 industry/product pairs per company
+5. Format as a clean markdown table
 
-    1. **Retrieve Complete Taxonomy** (ONCE ONLY):
-    - Use search_show_categories tool without any filters to get all available categories
+REQUIRED OUTPUT FORMAT:
+| Company Name | Trading Name | Tech Industry 1 | Tech Product 1 | Tech Industry 2 | Tech Product 2 | Tech Industry 3 | Tech Product 3 | Tech Industry 4 | Tech Product 4 |
 
-    2. **For EACH Company - Enhanced Research Phase:**
-    - Remember: These are ALL tech companies, so look for their technology products/services
-    - Choose research name priority: Domain > Trading Name > Account Name
-    - If Industry and Product/Service Type are available in the input data, incorporate them into your search queries
-    {chr(10).join(research_instructions)}
-    - Focus on their SOFTWARE, PLATFORMS, AI, DATA, CLOUD, or INFRASTRUCTURE offerings
-    - Identify what the company actually sells/offers in the TECH SECTOR
-
-    3. **Analysis Phase:**
-    - Map company offerings to relevant shows (CAI, DOL, CCSE, BDAIW, DCW)
-    - Match findings to EXACT taxonomy pairs from step 1
-    - Select up to 4 (Industry | Product) pairs per company
-    - Use pairs EXACTLY as they appear
-    - Absolutely mandatory to use the taxonomy pairs from step 1. DO NOT create new pairs or modify existing ones.
-
-    4. **Output Requirements:**
-    - Generate a markdown table with ONLY DATA ROWS (NO HEADER)
-    - Use this exact format for each company:
-    | Company Name | Trading Name | Tech Industry 1 | Tech Product 1 | Tech Industry 2 | Tech Product 2 | Tech Industry 3 | Tech Product 3 | Tech Industry 4 | Tech Product 4 |
-    - Do NOT include the header row in your response
-    - Do NOT provide additional text, explanations, or context
-    - ONLY the data rows without header
-
-    IMPORTANT CONTEXT FOR MATCHING:
-    - These companies exhibit at: Cloud and AI Infrastructure (CAI), DevOps Live (DOL), Data Centre World (DCW), Cloud and Cyber Security Expo (CCSE), Big Data and AI World (BDAIW)
-    - Look for their TECHNOLOGY offerings, not their general business
-    - A logistics company might offer "Platforms & Software | Big Data & Analytics Tools" for supply chain
-    - A finance company might offer "Platforms & Software | AI Applications" for fintech
-    - A retail company might offer "Platforms & Software | Cloud Security Solutions" for e-commerce
-
-    SEARCH STRATEGY:
-    - Always append tech keywords: "technology software platform cloud AI data"
-    - For domain searches: "site:[domain] technology platform software"
-    - For company searches: "[Company Name] technology software platform services"
-
-    CRITICAL RULES:
-    - MUST use search_show_categories to get taxonomy before starting
-    {tool_requirements}
-    - If Industry and Product/Service Type are available in input data, USE THEM to enhance search queries
-    - Use taxonomy pairs EXACTLY as written
-    - Output ONLY data rows (no header row)
-    - Each row should have company data only
-
-    Begin the systematic analysis now."""
+Research thoroughly and provide accurate classifications based on actual company information.
+"""
+        return prompt
     
     def parse_markdown_table(self, response: str) -> List[List[str]]:
         """Parse markdown table response into structured data."""
@@ -800,218 +599,94 @@ class EnhancedCompanyClassificationCLI:
     async def process_batch_with_retry(self, batch_companies: List[Dict], 
                                      batch_num: int, total_batches: int) -> List[List[str]]:
         """Process a batch with retry logic."""
+        print(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_companies)} companies)")
+        
         for attempt in range(self.max_retries):
             try:
-                print(f"🔄 Processing batch {batch_num}/{total_batches} (attempt {attempt + 1}/{self.max_retries})")
-                
-                batch_prompt = self.create_research_prompt(batch_companies)
-                conversation_memory = [HumanMessage(content=batch_prompt)]
-                
-                # Adjust timeout based on server selection
-                timeout = 600 if "perplexity" in self.enabled_servers else 300  # 10 min for Perplexity, 5 min for Google
-                
-                # Run the agent with timeout and comprehensive error handling
-                try:
-                    response = await asyncio.wait_for(
-                        self.agent.ainvoke({"messages": conversation_memory}),
-                        timeout=timeout
-                    )
-                except RecursionError as e:
-                    # Handle recursion errors specifically
-                    error_msg = f"Batch {batch_num} recursion error - try reducing batch size or complexity"
-                    print(f"   🔁 {error_msg}")
-                    if attempt < self.max_retries - 1:
-                        print(f"   🔄 Retrying with simplified approach...")
-                        await asyncio.sleep(self.retry_delay)
-                        continue
-                    else:
-                        self.progress.mark_batch_failed(batch_num, error_msg, str(e))
-                        return []
-                except Exception as llm_error:
-                    # Check for Azure OpenAI specific errors
-                    error_str = str(llm_error).lower()
-                    if any(keyword in error_str for keyword in ['quota', 'rate limit', 'billing', 'insufficient', 'exceeded']):
-                        error_msg = f"Batch {batch_num} Azure OpenAI API error: {str(llm_error)}"
-                        print(f"   🚨 {error_msg}")
-                        print(f"   💰 Azure OpenAI quota/billing issue detected:")
-                        
-                        if 'quota' in error_str:
-                            print(f"      - Check your Azure OpenAI quota limits")
-                            print(f"      - Consider upgrading your Azure subscription")
-                        elif 'rate limit' in error_str:
-                            print(f"      - Azure API rate limit hit")
-                            print(f"      - Wait before retrying or increase rate limits")
-                        elif 'billing' in error_str:
-                            print(f"      - Azure billing/payment issue")
-                            print(f"      - Check your Azure account billing status")
-                        
-                        print(f"   🛑 Stopping batch processing to avoid wasting API calls")
-                        self.progress.mark_batch_failed(batch_num, error_msg, traceback.format_exc())
-                        return []
-                    else:
-                        # Generic LLM error
-                        raise llm_error
-                
-                # Extract and clean the response
-                assistant_response = None
-                if "messages" in response:
-                    for msg in response["messages"]:
-                        if isinstance(msg, AIMessage) and hasattr(msg, "content") and msg.content:
-                            assistant_response = self.clean_response_content(str(msg.content))
-                            break
-                
-                if assistant_response and "|" in assistant_response:
-                    parsed_rows = self.parse_markdown_table(assistant_response)
-                    if parsed_rows:
-                        print(f"   ✅ Batch {batch_num} completed: {len(parsed_rows)} rows processed")
-                        return parsed_rows
-                
-                # If we get here, no valid response was found
-                if attempt < self.max_retries - 1:
-                    print(f"   ⚠️  Batch {batch_num} attempt {attempt + 1} failed (no valid response), retrying...")
+                if attempt > 0:
+                    print(f"   🔄 Retry attempt {attempt + 1}/{self.max_retries}")
                     await asyncio.sleep(self.retry_delay)
-                    continue
-                else:
-                    print(f"   ❌ Batch {batch_num} failed after {self.max_retries} attempts")
-                    return []
+                
+                # Create research prompt
+                prompt = self.create_research_prompt(batch_companies)
+                
+                # Execute research using MCP client
+                response = await self.client.execute_with_tools(prompt)
+                
+                if response and response.strip():
+                    # Parse the response
+                    table_rows = self.parse_markdown_table(response)
                     
-            except asyncio.TimeoutError:
-                error_msg = f"Batch {batch_num} timeout after {timeout//60} minutes"
-                print(f"   ⏰ {error_msg}")
-                if attempt < self.max_retries - 1:
-                    print(f"   🔄 Retrying in {self.retry_delay} seconds...")
-                    await asyncio.sleep(self.retry_delay)
-                    continue
+                    if table_rows:
+                        print(f"   ✅ Batch {batch_num} completed: {len(table_rows)} rows")
+                        return table_rows
+                    else:
+                        print(f"   ⚠️  Batch {batch_num} returned no valid table data")
+                        if attempt == self.max_retries - 1:
+                            return []
                 else:
-                    self.progress.mark_batch_failed(batch_num, error_msg)
-                    return []
-                    
+                    print(f"   ⚠️  Batch {batch_num} returned empty response")
+                    if attempt == self.max_retries - 1:
+                        return []
+                
             except Exception as e:
-                error_msg = f"Batch {batch_num} error: {str(e)}"
-                traceback_str = traceback.format_exc()
-                print(f"   ❌ {error_msg}")
-                
-                if attempt < self.max_retries - 1:
-                    print(f"   🔄 Retrying in {self.retry_delay} seconds...")
-                    await asyncio.sleep(self.retry_delay)
-                    continue
-                else:
-                    self.progress.mark_batch_failed(batch_num, error_msg, traceback_str)
+                print(f"   ❌ Error in batch {batch_num}, attempt {attempt + 1}: {str(e)}")
+                if attempt == self.max_retries - 1:
+                    print(f"   ❌ Batch {batch_num} failed after {self.max_retries} attempts")
                     return []
         
         return []
     
     async def classify_companies_batched(self, companies: List[Dict]) -> Tuple[str, List[List[str]]]:
-        """Classify companies using batched processing with proper header management."""
+        """Classify companies in batches with enhanced progress tracking."""
+        # Create batches
+        batches = [companies[i:i + self.batch_size] 
+                  for i in range(0, len(companies), self.batch_size)]
         
-        # Split companies into batches
-        batches = [companies[i:i + self.batch_size] for i in range(0, len(companies), self.batch_size)]
         total_batches = len(batches)
-        
-        print(f"📊 Created {total_batches} batches of {self.batch_size} companies each")
-        
-        # Load existing progress if available
-        progress_loaded = self.progress.load_progress()
-        
-        # Check if batch size has changed
-        if progress_loaded and self.progress.total_batches != total_batches:
-            print(f"⚠️  Batch configuration changed:")
-            print(f"   Previous: {self.progress.total_batches} batches")
-            print(f"   Current: {total_batches} batches")
-            print(f"   This may cause batch numbering issues. Consider using --clean-start")
-            
-            # Check for force continue flag via a simple approach
-            # (In a real implementation, you'd pass this as a parameter)
-            import sys
-            if "--force-continue" in sys.argv:
-                print("🔄 Forcing continuation with existing progress (--force-continue specified)")
-            else:
-                # Ask user what to do
-                print("Options:")
-                print("  1. Continue anyway (may have inconsistencies)")
-                print("  2. Start fresh (recommended)")
-                print("  3. Exit and use --clean-start")
-                
-                try:
-                    choice = input("Choose [1/2/3]: ").strip()
-                    if choice == "2":
-                        print("🧹 Starting fresh (clearing previous progress)")
-                        self.progress.cleanup_temp_files()
-                        self.progress = ProgressTracker(self.output_base)
-                        progress_loaded = False
-                    elif choice == "3":
-                        print("👋 Exiting. Run again with --clean-start to start fresh.")
-                        sys.exit(0)
-                    else:
-                        print("📂 Continuing with existing progress (batch numbers may be inconsistent)")
-                except KeyboardInterrupt:
-                    print("\n👋 Exiting. Run again with --clean-start to start fresh.")
-                    sys.exit(0)
-        
-        # Initialize progress tracker
         self.progress.total_batches = total_batches
-        self.progress.start_time = time.time()
         
-        if progress_loaded:
-            print(f"📂 Resuming from previous run...")
+        print(f"📊 Processing {len(companies)} companies in {total_batches} batches")
         
-        # Set default header if we don't have one
-        if self.progress.header_row is None:
-            self.progress.header_row = [
-                "Company Name", "Trading Name", 
-                "Tech Industry 1", "Tech Product 1",
-                "Tech Industry 2", "Tech Product 2", 
-                "Tech Industry 3", "Tech Product 3",
-                "Tech Industry 4", "Tech Product 4"
-            ]
-            print("📋 Using default header structure")
-        
-        # Get remaining batches to process (ensure valid range)
-        remaining_batches = [i for i in range(1, total_batches + 1) 
-                           if i not in self.progress.processed_batches and i <= total_batches]
+        # Get remaining batches to process
+        remaining_batches = self.progress.get_remaining_batches(total_batches)
         
         if not remaining_batches:
             print("✅ All batches already completed!")
         else:
             print(f"📊 Processing {len(remaining_batches)} remaining batches out of {total_batches} total")
             
-            # Show which batches are remaining
-            if len(remaining_batches) <= 10:
-                print(f"   Remaining batches: {remaining_batches}")
-            else:
-                print(f"   Remaining batches: {remaining_batches[:5]}...{remaining_batches[-5:]}")
-        
-        # Process remaining batches
-        for batch_idx in remaining_batches:
-            batch_num = batch_idx
-            batch_companies = batches[batch_idx - 1]  # Convert to 0-based for list access
-            
-            # Process batch with retry logic
-            batch_results = await self.process_batch_with_retry(batch_companies, batch_num, total_batches)
-            
-            if batch_results:
-                self.progress.mark_batch_completed(batch_num, batch_results)
-            else:
-                print(f"   ❌ Batch {batch_num} failed completely")
+            # Process remaining batches
+            for batch_idx in remaining_batches:
+                batch_num = batch_idx
+                batch_companies = batches[batch_idx - 1]  # Convert to 0-based for list access
                 
-                # Check if we should stop due to too many consecutive errors
-                if self.progress.should_stop_due_to_errors():
-                    print(f"❌ Stopping due to {self.progress.consecutive_errors} consecutive errors")
-                    break
-            
-            # Print progress update with corrected stats
-            completed_batches = len([b for b in self.progress.processed_batches if b <= total_batches])
-            success_rate = completed_batches / max(1, total_batches) * 100
-            print(f"📊 Progress: {completed_batches}/{total_batches} batches "
-                  f"({success_rate:.1f}% success rate, {len(self.progress.all_data_rows)} companies)")
+                # Process batch with retry logic
+                batch_results = await self.process_batch_with_retry(batch_companies, batch_num, total_batches)
+                
+                if batch_results:
+                    self.progress.mark_batch_completed(batch_num, batch_results)
+                else:
+                    print(f"   ❌ Batch {batch_num} failed completely")
+                    self.progress.mark_batch_failed(batch_num)
+                    
+                    # Check if we should stop due to too many consecutive errors
+                    if self.progress.should_stop_due_to_errors():
+                        print(f"❌ Stopping due to {self.progress.consecutive_errors} consecutive errors")
+                        break
+                
+                # Print progress update
+                stats = self.progress.get_stats()
+                print(f"📊 Progress: {stats['completed_batches']}/{total_batches} batches "
+                      f"({stats['success_rate']:.1f}% success rate, {len(self.progress.all_data_rows)} companies)")
         
         # Final save
         self.progress.save_progress()
         
-        # Generate final results with proper header
+        # Generate final results
         final_results = self.progress.get_final_results()
         
-        # Generate markdown content with single header
+        # Generate markdown content
         if final_results and len(final_results) > 0:
             header = final_results[0]
             data_rows = final_results[1:] if len(final_results) > 1 else []
@@ -1036,7 +711,7 @@ class EnhancedCompanyClassificationCLI:
         return markdown_content, final_results
     
     def save_csv_results(self, results: List[List[str]], csv_path: str):
-        """Save results to CSV file."""
+        """Save results to CSV file with enhanced sanitization for Excel compatibility."""
         if not results:
             print("⚠️  No results to save")
             return
@@ -1044,8 +719,44 @@ class EnhancedCompanyClassificationCLI:
         try:
             with open(csv_path, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerows(results)
+                
+                # Get header row to identify column positions
+                header_row = results[0] if results else []
+                account_name_idx = None
+                trading_name_idx = None
+                
+                # Find the indices of Account Name and Trading Name columns
+                for idx, header in enumerate(header_row):
+                    if header == 'Account Name' or 'Account Name' in header:
+                        account_name_idx = idx
+                    elif header == 'Trading Name' or 'Trading Name' in header:
+                        trading_name_idx = idx
+                
+                # Process each row
+                for row_idx, row in enumerate(results):
+                    if row_idx == 0:  # Header row
+                        writer.writerow(row)
+                    else:  # Data rows
+                        sanitized_row = list(row)  # Create a copy
+                        
+                        # Sanitize Account Name column if found
+                        if account_name_idx is not None and len(sanitized_row) > account_name_idx:
+                            sanitized_row[account_name_idx] = self.sanitize_csv_field(
+                                str(sanitized_row[account_name_idx])
+                            )
+                        
+                        # Sanitize Trading Name column if found
+                        if trading_name_idx is not None and len(sanitized_row) > trading_name_idx:
+                            sanitized_row[trading_name_idx] = self.sanitize_csv_field(
+                                str(sanitized_row[trading_name_idx])
+                            )
+                        
+                        writer.writerow(sanitized_row)
+                        
             print(f"💾 CSV results saved to: {csv_path}")
+            if account_name_idx is not None or trading_name_idx is not None:
+                print(f"✅ Applied Excel-compatible sanitization to Account Name and Trading Name columns")
+            
         except Exception as e:
             raise ValueError(f"Error saving CSV results: {e}")
     
@@ -1088,7 +799,7 @@ class EnhancedCompanyClassificationCLI:
 async def main():
     """Main CLI function with enhanced server support."""
     parser = argparse.ArgumentParser(
-        description="Enhanced Company Classification CLI Tool with Perplexity Integration",
+        description="Enhanced Company Classification CLI Tool with CSV Sanitization",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -1106,9 +817,6 @@ async def main():
     parser.add_argument("--force-continue", action="store_true",
                        help="Continue with existing progress even if batch size changed")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
-        # Remove recursion limit parameter since it's not being used
-        # parser.add_argument("--recursion-limit", type=int, default=30,
-        #                    help="Set Python recursion limit (default: 30)")
     
     args = parser.parse_args()
     
@@ -1131,7 +839,7 @@ async def main():
             print(f"⚠️  NOTE: Perplexity works best with batch size 2 or smaller")
             print(f"   You specified {batch_size}. Consider using --batch-size 2 if you encounter issues.")
         
-        # Initialize CLI tool with enhanced features (no recursion limit parameter)
+        # Initialize CLI tool
         cli = EnhancedCompanyClassificationCLI(
             config_path=args.config,
             batch_size=batch_size,
@@ -1144,7 +852,7 @@ async def main():
             print("🧹 Starting fresh (ignoring previous progress)")
             cli.progress.cleanup_temp_files()
         
-        print("🚀 Enhanced Company Classification CLI Tool with Perplexity Integration")
+        print("🚀 Enhanced Company Classification CLI Tool with CSV Sanitization")
         print("=" * 80)
         print(f"🔧 Enabled servers: {', '.join(enabled_servers)}")
         print(f"📊 Batch size: {batch_size}")
@@ -1166,7 +874,7 @@ async def main():
         # Save results
         await cli.save_results(markdown_content, csv_results, args.output)
         
-        # Print final summary with corrected calculations
+        # Print final summary
         stats = cli.progress.get_stats()
         completed_valid = stats['completed_batches']
         total_batches = stats['total_batches']
@@ -1180,51 +888,25 @@ async def main():
         print(f"   Total errors: {stats['error_count']}")
         print(f"   Total data rows: {stats['total_data_rows']}")
         print(f"   Header present: {stats['has_header']}")
-        print(f"   Processing time: {stats['elapsed_time']/3600:.1f} hours")
-        print(f"   Servers used: {', '.join(enabled_servers)}")
+        print(f"   Processing time: {stats['elapsed_time']:.1f}s")
         
-        # Add comprehensive error summary if there were failures
-        if stats['failed_batches'] > 0:
-            print(f"\n🚨 Error Summary:")
-            print(f"   Failed batches: {stats['failed_batches']}")
-            print(f"   Check error details in: {cli.progress.error_log_file}")
-            print(f"\n💡 Common solutions:")
-            print(f"   - For quota errors: Add more credits to your API accounts")
-            print(f"   - For rate limits: Wait before retrying or upgrade your API plan")
-            print(f"   - For auth errors: Check API keys in your .env file")
-            print(f"   - For network errors: Check internet connection and try again")
-            print(f"   - To retry failed batches: Use --resume flag")
-        
-        # Clean up temp files on successful completion
-        if completed_valid == total_batches:
+        # Cleanup if successful
+        if stats['success_rate'] > 90:
+            print("🧹 Cleaning up temporary files...")
             cli.progress.cleanup_temp_files()
-            print("✅ Processing completed successfully! Temporary files cleaned up.")
-            print("🎉 Results saved with single header and no duplicates!")
-        else:
-            # Find the next batch that needs processing
-            all_batches = set(range(1, total_batches + 1))
-            processed_batches = set(b for b in cli.progress.processed_batches if b <= total_batches)
-            remaining_batches = all_batches - processed_batches
-            
-            if remaining_batches:
-                next_batch = min(remaining_batches)
-                print(f"⚠️  Processing incomplete. Use --resume to continue from batch {next_batch}")
-            else:
-                print("✅ All valid batches completed (some historical batches may be out of range)")
-                cli.progress.cleanup_temp_files()
-                print("🎉 Results saved with single header and no duplicates!")
-            print(f"   Progress saved in: {cli.progress.progress_file}")
         
         return 0
         
+    except KeyboardInterrupt:
+        print("\n🛑 Process interrupted by user")
+        return 1
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"❌ Error: {e}")
         if args.verbose:
-            print("\nFull traceback:")
             traceback.print_exc()
         return 1
-    
     finally:
+        # Cleanup connections
         if 'cli' in locals():
             await cli.cleanup()
 
