@@ -17,7 +17,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 # Load environment variables
-load_dotenv("mcp-chatbot/servers/server_mssql/mssql_mcp_server/.env4test")
+load_dotenv(".env")
 
 # Configure logging
 logging.basicConfig(
