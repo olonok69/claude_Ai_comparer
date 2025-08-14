@@ -92,16 +92,16 @@ async def list_tables() -> list[TextContent]:
                 tables = cursor.fetchall()
                 
                 if not tables:
-                    return [TextContent(text="No tables found in the database.")]
+                    return [TextContent(type="text", text="No tables found in the database.")]
                 
                 result = "Tables in database:\n\n"
                 for table in tables:
                     result += f"• {table.TABLE_SCHEMA}.{table.TABLE_NAME} ({table.TABLE_TYPE})\n"
-
-                return [TextContent(type="text",text=result)]
+                
+                return [TextContent(type="text", text=result)]
     except Exception as e:
         logger.error(f"Failed to list tables: {e}")
-        return [TextContent(type="text",text=f"Error listing tables: {str(e)}")]
+        return [TextContent(type="text", text=f"Error listing tables: {str(e)}")]
 
 @mcp.tool()
 async def describe_table(table_name: str) -> list[TextContent]:
@@ -133,7 +133,7 @@ async def describe_table(table_name: str) -> list[TextContent]:
                 columns = cursor.fetchall()
                 
                 if not columns:
-                    return [TextContent(type="text",text=f"Table '{table_name}' not found.")]
+                    return [TextContent(type="text", text=f"Table '{table_name}' not found.")]
                 
                 result = f"Structure of {schema}.{table}:\n\n"
                 for col in columns:
@@ -142,10 +142,10 @@ async def describe_table(table_name: str) -> list[TextContent]:
                     default = f" DEFAULT {col.COLUMN_DEFAULT}" if col.COLUMN_DEFAULT else ""
                     result += f"• {col.COLUMN_NAME}: {col.DATA_TYPE}{length} {nullable}{default}\n"
                 
-                return [TextContent(type="text",text=result)]
+                return [TextContent(type="text", text=result)]
     except Exception as e:
         logger.error(f"Failed to describe table {table_name}: {e}")
-        return [TextContent(type="text",text=f"Error describing table: {str(e)}")]
+        return [TextContent(type="text", text=f"Error describing table: {str(e)}")]
 
 @mcp.tool()
 async def query_database(query: str, max_rows: Optional[int] = 100) -> list[TextContent]:
@@ -162,7 +162,7 @@ async def query_database(query: str, max_rows: Optional[int] = 100) -> list[Text
                     rows = cursor.fetchmany(max_rows) if max_rows else cursor.fetchall()
                     
                     if not rows:
-                        return [TextContent(type="text",text="Query executed successfully. No rows returned.")]
+                        return [TextContent(type="text", text="Query executed successfully. No rows returned.")]
                     
                     # Convert rows to serializable format
                     serialized_rows = [serialize_row_data(row) for row in rows]
@@ -174,15 +174,14 @@ async def query_database(query: str, max_rows: Optional[int] = 100) -> list[Text
                         "truncated": len(rows) == max_rows if max_rows else False
                     }
                     
-                    return [TextContent(type="text",text=json.dumps(result, indent=2, default=str))]
+                    return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
                 else:
                     # For non-SELECT queries
                     conn.commit()
-                    return [TextContent(type="text",text=f"Query executed successfully. Rows affected: {cursor.rowcount}")]
-                    
+                    return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {cursor.rowcount}")]
     except Exception as e:
         logger.error(f"Failed to execute query: {e}")
-        return [TextContent(text=f"Error executing query: {str(e)}")]
+        return [TextContent(type="text", text=f"Error executing query: {str(e)}")]
 
 # Health check endpoint
 async def health_check(request):
@@ -225,51 +224,47 @@ app = Starlette(
 )
 
 if __name__ == "__main__":
-    protocol = "https" if USE_HTTPS else "http"
+    logger.info(f"Starting MSSQL MCP Server with SSE transport...")
+    logger.info(f"MSSQL HOST: {os.getenv('MSSQL_HOST')}")
+    logger.info(f"MSSQL DB: {os.getenv('MSSQL_DATABASE')}")
+    logger.info(f"MSSQL username: {os.getenv('MSSQL_USER')}")
     
     if USE_HTTPS:
-        # SSL certificate configuration
-        cert_path = os.getenv("SSL_CERT_PATH", "certs/server.crt")
-        key_path = os.getenv("SSL_KEY_PATH", "certs/server.key")
+        # Generate self-signed certificate if it doesn't exist
+        cert_file = "cert.pem"
+        key_file = "key.pem"
         
-        # Check if certificate files exist
-        if not os.path.exists(cert_path) or not os.path.exists(key_path):
-            logger.error(f"Certificate files not found at {cert_path} and {key_path}")
-            logger.error("Please generate them first using: ./generate_certs.sh")
-            logger.error("Or run without HTTPS by setting USE_HTTPS=false")
-            exit(1)
+        if not (os.path.exists(cert_file) and os.path.exists(key_file)):
+            logger.info("Generating self-signed certificate...")
+            import subprocess
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:4096",
+                "-keyout", key_file, "-out", cert_file,
+                "-days", "365", "-nodes",
+                "-subj", "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+            ])
         
-        logger.info("Starting MSSQL MCP Server with SSE transport over HTTPS...")
-        logger.info(f"MSSQL HOST: {os.getenv('MSSQL_HOST')}")
-        logger.info(f"MSSQL DB: {os.getenv('MSSQL_DATABASE')}")
-        logger.info(f"MSSQL username: {os.getenv('MSSQL_USER')}")
         logger.info(f"MSSQL MCP Server running on https://0.0.0.0:{PORT}")
         logger.info(f"SSE endpoint: https://0.0.0.0:{PORT}/sse")
         logger.info(f"Health check: https://0.0.0.0:{PORT}/health")
         logger.info("⚠️  Using self-signed certificate - browsers will show security warning")
         
-        # Run with SSL
         uvicorn.run(
-            app, 
-            host="0.0.0.0", 
-            port=PORT, 
-            log_level="info",
-            ssl_keyfile=key_path,
-            ssl_certfile=cert_path
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            ssl_keyfile=key_file,
+            ssl_certfile=cert_file,
+            log_level="info"
         )
     else:
-        logger.info("Starting MSSQL MCP Server with SSE transport over HTTP...")
-        logger.info(f"MSSQL HOST: {os.getenv('MSSQL_HOST')}")
-        logger.info(f"MSSQL DB: {os.getenv('MSSQL_DATABASE')}")
-        logger.info(f"MSSQL username: {os.getenv('MSSQL_USER')}")
         logger.info(f"MSSQL MCP Server running on http://0.0.0.0:{PORT}")
         logger.info(f"SSE endpoint: http://0.0.0.0:{PORT}/sse")
         logger.info(f"Health check: http://0.0.0.0:{PORT}/health")
         
-        # Run without SSL
         uvicorn.run(
-            app, 
-            host="0.0.0.0", 
-            port=PORT, 
+            app,
+            host="0.0.0.0",
+            port=PORT,
             log_level="info"
         )
